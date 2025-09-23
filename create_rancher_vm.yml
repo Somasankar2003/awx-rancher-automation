@@ -57,7 +57,19 @@
             - curl -fsSL https://get.docker.com | sh
             - usermod -aG docker ubuntu
             - echo "Running Rancher registration..."
-            - {{ reg_command }}
+            - curl --insecure -fL https://192.168.170.67/system-agent-install.sh | sudo sh -s - --server https://192.168.170.67 --label 'cattle.io/os=linux' --token 5kz5vjdtfpzjdw54zdc9nkdmzlktrzzfgclbfs7cfp9zxtpmnc4gps --ca-checksum 6084395a78f897c01300c9fa486331eb81316b8271d7c45c64323eab518b51c0 --etcd --controlplane --worker
+
+    - name: Set OpenStack credentials from environment
+      set_fact:
+        os_auth_url: "http://192.168.150.31:5000/v3"
+        os_project_name: "XAS"
+        os_project_domain_name: "Default"
+        os_username: "admin"
+        os_user_domain_name: "Default"
+        os_password: "2rlpcV3k3OPv"
+        os_region_name: "RegionOne"
+        os_interface: "internalURL"
+        os_identity_api_version: "3"
 
     - name: Create VM on OpenStack with cloud-init
       os_server:
@@ -70,7 +82,19 @@
           - net-id: "{{ vm_net }}"
         userdata: "{{ lookup('file', './cloud-init.yml') }}"
         auto_ip: yes
+        cloud:
+          auth:
+            auth_url: "{{ os_auth_url }}"
+            project_name: "{{ os_project_name }}"
+            project_domain_name: "{{ os_project_domain_name }}"
+            username: "{{ os_username }}"
+            user_domain_name: "{{ os_user_domain_name }}"
+            password: "{{ os_password }}"
+            region_name: "{{ os_region_name }}"
+            interface: "{{ os_interface }}"
+            identity_api_version: "{{ os_identity_api_version }}"
       register: new_vm
 
     - debug:
         msg: "VM {{ vm_name }} created with IP {{ new_vm.server.public_v4 | default(new_vm.server.private_v4) | default('No IP assigned') }}"
+b
