@@ -6,9 +6,9 @@
 
   vars:
     # Rancher details
-    rancher_url: "https://192.168.170.45"
-    rancher_token: "token-992sp:phgs5wlpqpf4brjtjdxkqvlsd5tlmn2kgnd2wlj68tmwfdw975n7z8"  # your Rancher API token
-    cluster_name: "openstack-cluster-2"   # replace with your actual cluster name
+    rancher_url: "https://192.168.170.67"
+    rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"  # your Rancher API token
+    cluster_name: "openstack-cluster"   # replace with your actual cluster name
 
     # OpenStack details
     vm_name: "rancher-node-1"
