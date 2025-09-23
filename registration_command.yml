@@ -1,5 +1,6 @@
 - name: Get Rancher cluster registration command
   hosts: localhost
+  gather_facts: false
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
@@ -49,9 +50,21 @@
         validate_certs: false
       register: tokens_response
 
-    - name: Build registration command with --insecure and roles
+    - name: Set token, command, and optional CA checksum
       set_fact:
-        registration_cmd: "{{ tokens_response.json.data[0].nodeCommand | regex_replace('curl -fL', 'curl --insecure -fL') }} --etcd --controlplane --worker"
+        token: "{{ tokens_response.json.data[0].token }}"
+        ca_checksum: "{{ tokens_response.json.data[0]['caChecksum'] | default('') }}"
+        insecure_node_cmd: "{{ tokens_response.json.data[0].insecureNodeCommand }}"
+
+    - name: Build exact registration command
+      set_fact:
+        registration_cmd: >-
+          {{ insecure_node_cmd }}
+          --server {{ rancher_url }}
+          --label 'cattle.io/os=linux'
+          --token {{ token }}
+          --ca-checksum {{ ca_checksum }}
+          --etcd --controlplane --worker
 
     - name: Print exact registration command
       debug:
