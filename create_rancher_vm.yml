@@ -67,9 +67,8 @@
         os_username: "admin"
         os_user_domain_name: "Default"
         os_password: "2rlpcV3k3OPv"
-        os_region_name: "RegionOne"
         os_interface: "internalURL"
-        os_identity_api_version: "3"
+        os_region_name: "RegionOne"  # Region is fine here
 
     - name: Create VM on OpenStack with cloud-init
       os_server:
@@ -90,11 +89,8 @@
             username: "{{ os_username }}"
             user_domain_name: "{{ os_user_domain_name }}"
             password: "{{ os_password }}"
-            region_name: "{{ os_region_name }}"
-            interface: "{{ os_interface }}"
-            identity_api_version: "{{ os_identity_api_version }}"
+          region_name: "{{ os_region_name }}"  # Keep region here
       register: new_vm
 
     - debug:
         msg: "VM {{ vm_name }} created with IP {{ new_vm.server.public_v4 | default(new_vm.server.private_v4) | default('No IP assigned') }}"
-b
