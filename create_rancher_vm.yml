@@ -1,5 +1,5 @@
 ---
-- name: Create VM on OpenStack and auto-register to Rancher
+- name: Create VM on OpenStack and auto-register to Rancher (Simplified)
   hosts: localhost
   connection: local
   gather_facts: no
@@ -7,8 +7,8 @@
   vars:
     # Rancher details
     rancher_url: "https://192.168.170.67"
-    rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"  # your Rancher API token
-    cluster_name: "openstack-cluster"   # replace with your actual cluster name
+    rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
+    cluster_name: "openstack-cluster"
 
     # OpenStack details
     vm_name: "rancher-node-1"
@@ -24,6 +24,7 @@
         method: GET
         headers:
           Authorization: "Bearer {{ rancher_token }}"
+          Content-Type: "application/json"
         validate_certs: no
       register: cluster_info
 
@@ -31,44 +32,32 @@
       set_fact:
         cluster_id: "{{ cluster_info.json.data[0].id }}"
 
-    - name: Get registration command from Rancher
+    - name: Get registration token from Rancher
       uri:
         url: "{{ rancher_url }}/v3/clusterregistrationtokens?clusterId={{ cluster_id }}"
         method: GET
         headers:
           Authorization: "Bearer {{ rancher_token }}"
+          Content-Type: "application/json"
         validate_certs: no
       register: reg_info
 
-    - name: Extract registration command and add roles
+    - name: Use the insecureNodeCommand directly from Rancher and add roles
       set_fact:
-        reg_command: "{{ reg_info.json.data[0].nodeCommand | regex_replace('curl -fL', 'curl --insecure -fL') }} --etcd --controlplane --worker"
+        registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --etcd --controlplane --worker --label 'cattle.io/os=linux'"
 
     - name: Create cloud-init user_data file
       copy:
-        dest: ./cloud-init.yml
+        dest: ./cloud-init-{{ vm_name }}.yml
         content: |
           #cloud-config
           package_update: true
           packages:
             - curl
-            - jq
           runcmd:
             - curl -fsSL https://get.docker.com | sh
             - usermod -aG docker ubuntu
-            - echo "Running Rancher registration..."
-            - curl --insecure -fL https://192.168.170.67/system-agent-install.sh | sudo sh -s - --server https://192.168.170.67 --label 'cattle.io/os=linux' --token 5kz5vjdtfpzjdw54zdc9nkdmzlktrzzfgclbfs7cfp9zxtpmnc4gps --ca-checksum 6084395a78f897c01300c9fa486331eb81316b8271d7c45c64323eab518b51c0 --etcd --controlplane --worker
-
-    - name: Set OpenStack credentials from environment
-      set_fact:
-        os_auth_url: "http://192.168.150.31:5000/v3"
-        os_project_name: "XAS"
-        os_project_domain_name: "Default"
-        os_username: "admin"
-        os_user_domain_name: "Default"
-        os_password: "2rlpcV3k3OPv"
-        os_interface: "internalURL"
-        os_region_name: "RegionOne"  # Region is fine here
+            - {{ registration_command }}
 
     - name: Create VM on OpenStack with cloud-init
       os_server:
@@ -79,17 +68,17 @@
         key_name: "{{ vm_keypair }}"
         nics:
           - net-id: "{{ vm_net }}"
-        userdata: "{{ lookup('file', './cloud-init.yml') }}"
+        userdata: "{{ lookup('file', './cloud-init-' + vm_name + '.yml') }}"
         auto_ip: yes
         cloud:
           auth:
-            auth_url: "{{ os_auth_url }}"
-            project_name: "{{ os_project_name }}"
-            project_domain_name: "{{ os_project_domain_name }}"
-            username: "{{ os_username }}"
-            user_domain_name: "{{ os_user_domain_name }}"
-            password: "{{ os_password }}"
-          region_name: "{{ os_region_name }}"  # Keep region here
+            auth_url: "http://192.168.150.31:5000/v3"
+            project_name: "XAS"
+            project_domain_name: "Default"
+            username: "admin"
+            user_domain_name: "Default"
+            password: "2rlpcV3k3OPv"
+          region_name: "RegionOne"
       register: new_vm
 
     - debug:
