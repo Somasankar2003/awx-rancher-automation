@@ -9,12 +9,12 @@
     rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "openstack-cluster"
 
-    # These will come from the AWX survey
+    # These will come from AWX survey
     vm_count: "{{ vm_count }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
 
-    # Static values
+    # Static
     vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
     vm_keypair: "rke"
     os_auth_url: "http://192.168.150.31:5000/v3"
@@ -55,53 +55,55 @@
       set_fact:
         registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --etcd --controlplane --worker --label 'cattle.io/os=linux'"
 
-    - name: Generate list of VM indexes
+    - name: Generate VM list
       set_fact:
         vm_list: "{{ range(1, vm_count | int + 1) | list }}"
 
-    - name: Provision each VM
-      vars:
-        vm_name: "rancher-node-{{ item | string | zfill(3) }}"
-        cloud_init_path: "/tmp/cloud-init-{{ 'rancher-node-' + (item | string | zfill(3)) }}.yml"
+    - name: Create cloud-init files
+      copy:
+        dest: "/tmp/cloud-init-rancher-node-{{ item | string | zfill(3) }}.yml"
+        content: |
+          #cloud-config
+          package_update: true
+          packages:
+            - curl
+          runcmd:
+            - curl -fsSL https://get.docker.com | sh
+            - usermod -aG docker ubuntu
+            - {{ registration_command }}
+      loop: "{{ vm_list }}"
+      loop_control:
+        label: "cloud-init-rancher-node-{{ item | string | zfill(3) }}.yml"
+
+    - name: Launch VMs
+      os_server:
+        state: present
+        name: "rancher-node-{{ item | string | zfill(3) }}"
+        image: "{{ vm_image }}"
+        flavor: "{{ vm_flavor }}"
+        key_name: "{{ vm_keypair }}"
+        nics:
+          - net-id: "{{ vm_net }}"
+        userdata: "{{ lookup('file', '/tmp/cloud-init-rancher-node-' + (item | string | zfill(3)) + '.yml') }}"
+        auto_ip: yes
+        cloud:
+          auth:
+            auth_url: "{{ os_auth_url }}"
+            project_name: "{{ os_project_name }}"
+            project_domain_name: "{{ os_project_domain }}"
+            username: "{{ os_username }}"
+            user_domain_name: "{{ os_user_domain }}"
+            password: "{{ os_password }}"
+          region_name: "{{ os_region_name }}"
       loop: "{{ vm_list }}"
       loop_control:
         label: "rancher-node-{{ item | string | zfill(3) }}"
-      tasks:
-        - name: Create cloud-init file
-          copy:
-            dest: "{{ cloud_init_path }}"
-            content: |
-              #cloud-config
-              package_update: true
-              packages:
-                - curl
-              runcmd:
-                - curl -fsSL https://get.docker.com | sh
-                - usermod -aG docker ubuntu
-                - {{ registration_command }}
+      register: new_vms
 
-        - name: Create VM on OpenStack
-          os_server:
-            state: present
-            name: "{{ vm_name }}"
-            image: "{{ vm_image }}"
-            flavor: "{{ vm_flavor }}"
-            key_name: "{{ vm_keypair }}"
-            nics:
-              - net-id: "{{ vm_net }}"
-            userdata: "{{ lookup('file', cloud_init_path) }}"
-            auto_ip: yes
-            cloud:
-              auth:
-                auth_url: "{{ os_auth_url }}"
-                project_name: "{{ os_project_name }}"
-                project_domain_name: "{{ os_project_domain }}"
-                username: "{{ os_username }}"
-                user_domain_name: "{{ os_user_domain }}"
-                password: "{{ os_password }}"
-              region_name: "{{ os_region_name }}"
-          register: new_vm
-
-        - name: Show VM result
-          debug:
-            msg: "Created VM {{ vm_name }} with IP {{ new_vm.server.public_v4 | default(new_vm.server.private_v4) | default('No IP') }}"
+    - name: Show results
+      debug:
+        msg: >
+          VM rancher-node-{{ item.item | string | zfill(3) }} created with IP {{
+            item.server.public_v4 | default(item.server.private_v4) | default('No IP')
+          }}
+      loop: "{{ new_vms.results }}"
