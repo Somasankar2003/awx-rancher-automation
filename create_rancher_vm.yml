@@ -54,47 +54,48 @@
       set_fact:
         registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --etcd --controlplane --worker --label 'cattle.io/os=linux'"
 
-    - name: Create multiple VMs
-      loop: "{{ range(1, vm_count + 1) | list }}"
-      vars:
-        vm_name: "rancher-node-{{ item }}"
-        cloud_init_path: "/tmp/cloud-init-{{ vm_name }}.yml"
-      block:
-        - name: Create cloud-init user_data file
-          copy:
-            dest: "{{ cloud_init_path }}"
-            content: |
-              #cloud-config
-              package_update: true
-              packages:
-                - curl
-              runcmd:
-                - curl -fsSL https://get.docker.com | sh
-                - usermod -aG docker ubuntu
-                - {{ registration_command }}
+    - name: Generate VM list
+      set_fact:
+        vm_list: "{{ range(1, vm_count + 1) | map('string') | list }}"
 
-        - name: Create VM on OpenStack
-          os_server:
-            state: present
-            name: "{{ vm_name }}"
-            image: "{{ vm_image }}"
-            flavor: "{{ vm_flavor }}"
-            key_name: "{{ vm_keypair }}"
-            nics:
-              - net-id: "{{ vm_net }}"
-            userdata: "{{ lookup('file', cloud_init_path) }}"
-            auto_ip: yes
-            cloud:
-              auth:
-                auth_url: "{{ os_auth_url }}"
-                project_name: "{{ os_project_name }}"
-                project_domain_name: "{{ os_project_domain }}"
-                username: "{{ os_username }}"
-                user_domain_name: "{{ os_user_domain }}"
-                password: "{{ os_password }}"
-              region_name: "{{ os_region_name }}"
-          register: new_vm
+    - name: Create cloud-init user_data files
+      copy:
+        dest: "/tmp/cloud-init-rancher-node-{{ item }}.yml"
+        content: |
+          #cloud-config
+          package_update: true
+          packages:
+            - curl
+          runcmd:
+            - curl -fsSL https://get.docker.com | sh
+            - usermod -aG docker ubuntu
+            - {{ registration_command }}
+      loop: "{{ vm_list }}"
 
-        - name: Show created VM details
-          debug:
-            msg: "VM {{ vm_name }} created with IP {{ new_vm.server.public_v4 | default(new_vm.server.private_v4) | default('No IP assigned') }}"
+    - name: Create VMs on OpenStack
+      os_server:
+        state: present
+        name: "rancher-node-{{ item }}"
+        image: "{{ vm_image }}"
+        flavor: "{{ vm_flavor }}"
+        key_name: "{{ vm_keypair }}"
+        nics:
+          - net-id: "{{ vm_net }}"
+        userdata: "{{ lookup('file', '/tmp/cloud-init-rancher-node-' + item + '.yml') }}"
+        auto_ip: yes
+        cloud:
+          auth:
+            auth_url: "{{ os_auth_url }}"
+            project_name: "{{ os_project_name }}"
+            project_domain_name: "{{ os_project_domain }}"
+            username: "{{ os_username }}"
+            user_domain_name: "{{ os_user_domain }}"
+            password: "{{ os_password }}"
+          region_name: "{{ os_region_name }}"
+      register: new_vm
+      loop: "{{ vm_list }}"
+
+    - name: Show created VM details
+      debug:
+        msg: "VM rancher-node-{{ item }} created with IP {{ new_vm.results[loop.index0].server.public_v4 | default(new_vm.results[loop.index0].server.private_v4) | default('No IP assigned') }}"
+      loop: "{{ vm_list }}"
