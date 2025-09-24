@@ -1,20 +1,20 @@
 ---
-- name: Provision multiple VMs on OpenStack and register to Rancher
+- name: Create multiple VMs on OpenStack and auto-register to Rancher
   hosts: localhost
   connection: local
-  gather_facts: false
+  gather_facts: no
 
   vars:
     rancher_url: "https://192.168.170.67"
     rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "openstack-cluster"
 
-    # These are expected to come from AWX survey
-    vm_count: "{{ vm_count }}"
+    # From AWX Survey
+    vm_count: "{{ vm_count | int }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
 
-    # Static values (can be changed if needed)
+    # Static OpenStack details
     vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
     vm_keypair: "rke"
     os_auth_url: "http://192.168.150.31:5000/v3"
@@ -26,14 +26,6 @@
     os_region_name: "RegionOne"
 
   tasks:
-
-    - name: Validate vm_count
-      assert:
-        that:
-          - vm_count is defined
-          - vm_count | int > 0
-        fail_msg: "'vm_count' must be defined and greater than 0."
-
     - name: Get cluster ID from Rancher
       uri:
         url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
@@ -58,57 +50,51 @@
         validate_certs: no
       register: reg_info
 
-    - name: Extract registration command
+    - name: Prepare registration command with roles and label
       set_fact:
         registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --etcd --controlplane --worker --label 'cattle.io/os=linux'"
 
-    - name: Generate list of VM indexes
-      set_fact:
-        vm_list: "{{ range(1, (vm_count | int) + 1) | list }}"
+    - name: Create multiple VMs
+      loop: "{{ range(1, vm_count + 1) | list }}"
+      vars:
+        vm_name: "rancher-node-{{ item }}"
+        cloud_init_path: "/tmp/cloud-init-{{ vm_name }}.yml"
+      block:
+        - name: Create cloud-init user_data file
+          copy:
+            dest: "{{ cloud_init_path }}"
+            content: |
+              #cloud-config
+              package_update: true
+              packages:
+                - curl
+              runcmd:
+                - curl -fsSL https://get.docker.com | sh
+                - usermod -aG docker ubuntu
+                - {{ registration_command }}
 
-    - name: Create cloud-init files for all VMs
-      copy:
-        dest: "/tmp/cloud-init-rancher-node-{{ item | string | zfill(3) }}.yml"
-        content: |
-          #cloud-config
-          package_update: true
-          packages:
-            - curl
-          runcmd:
-            - curl -fsSL https://get.docker.com | sh
-            - usermod -aG docker ubuntu
-            - {{ registration_command }}
-      loop: "{{ vm_list }}"
-      loop_control:
-        label: "rancher-node-{{ item | string | zfill(3) }}"
+        - name: Create VM on OpenStack
+          os_server:
+            state: present
+            name: "{{ vm_name }}"
+            image: "{{ vm_image }}"
+            flavor: "{{ vm_flavor }}"
+            key_name: "{{ vm_keypair }}"
+            nics:
+              - net-id: "{{ vm_net }}"
+            userdata: "{{ lookup('file', cloud_init_path) }}"
+            auto_ip: yes
+            cloud:
+              auth:
+                auth_url: "{{ os_auth_url }}"
+                project_name: "{{ os_project_name }}"
+                project_domain_name: "{{ os_project_domain }}"
+                username: "{{ os_username }}"
+                user_domain_name: "{{ os_user_domain }}"
+                password: "{{ os_password }}"
+              region_name: "{{ os_region_name }}"
+          register: new_vm
 
-    - name: Create VMs on OpenStack
-      os_server:
-        state: present
-        name: "rancher-node-{{ item | string | zfill(3) }}"
-        image: "{{ vm_image }}"
-        flavor: "{{ vm_flavor }}"
-        key_name: "{{ vm_keypair }}"
-        nics:
-          - net-id: "{{ vm_net }}"
-        userdata: "{{ lookup('file', '/tmp/cloud-init-rancher-node-' + (item | string | zfill(3)) + '.yml') }}"
-        auto_ip: yes
-        cloud:
-          auth:
-            auth_url: "{{ os_auth_url }}"
-            project_name: "{{ os_project_name }}"
-            project_domain_name: "{{ os_project_domain }}"
-            username: "{{ os_username }}"
-            user_domain_name: "{{ os_user_domain }}"
-            password: "{{ os_password }}"
-          region_name: "{{ os_region_name }}"
-      loop: "{{ vm_list }}"
-      register: created_vms
-
-    - name: Show results for each VM
-      debug:
-        msg: >
-          VM rancher-node-{{ item.item | string | zfill(3) }} created with IP {{
-            item.server.public_v4 | default(item.server.private_v4) | default('No IP')
-          }}
-      loop: "{{ created_vms.results }}"
+        - name: Show created VM details
+          debug:
+            msg: "VM {{ vm_name }} created with IP {{ new_vm.server.public_v4 | default(new_vm.server.private_v4) | default('No IP assigned') }}"
