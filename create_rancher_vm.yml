@@ -10,9 +10,16 @@
     rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "openstack-cluster"
 
-    # OpenStack defaults (can be overridden, but no defaults for net/flavor/count)
+    # These come from AWX survey
+    vm_count: "{{ vm_count }}"
+    vm_net: "{{ vm_net }}"
+    vm_flavor: "{{ vm_flavor }}"
+
+    # Static VM details
     vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
     vm_keypair: "rke"
+
+    # OpenStack auth
     os_auth_url: "http://192.168.150.31:5000/v3"
     os_project_name: "XAS"
     os_project_domain: "Default"
@@ -22,29 +29,6 @@
     os_region_name: "RegionOne"
 
   tasks:
-    - name: Fail if vm_net is not provided
-      fail:
-        msg: "vm_net must be provided (network ID)."
-      when: vm_net is not defined or vm_net == ""
-
-    - name: Fail if vm_flavor is not provided
-      fail:
-        msg: "vm_flavor must be provided (flavor ID)."
-      when: vm_flavor is not defined or vm_flavor == ""
-
-    - name: Fail if vm_count is not provided or invalid
-      fail:
-        msg: "vm_count must be provided and be a positive integer."
-      when: vm_count is not defined or vm_count | int < 1
-
-    - name: Convert vm_count to integer
-      set_fact:
-        vm_count: "{{ vm_count | int }}"
-
-    - name: Generate VM list
-      set_fact:
-        vm_list: "{{ query('sequence', 'start=1 end=' + vm_count|string) }}"
-
     - name: Get cluster ID from Rancher
       uri:
         url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
@@ -73,50 +57,54 @@
       set_fact:
         registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --etcd --controlplane --worker --label 'cattle.io/os=linux'"
 
-    - name: Create cloud-init user_data files
-      loop: "{{ vm_list }}"
+    - name: Create VM list
+      set_fact:
+        vm_list: "{{ query('sequence', 'start=1 end=' + (vm_count | string)) }}"
+
+    - name: Provision VMs
       vars:
         vm_name: "rancher-node-{{ item }}"
         cloud_init_path: "/tmp/cloud-init-{{ vm_name }}.yml"
-      copy:
-        dest: "{{ cloud_init_path }}"
-        content: |
-          #cloud-config
-          package_update: true
-          packages:
-            - curl
-          runcmd:
-            - curl -fsSL https://get.docker.com | sh
-            - usermod -aG docker ubuntu
-            - {{ registration_command }}
-
-    - name: Create VM on OpenStack
       loop: "{{ vm_list }}"
-      vars:
-        vm_name: "rancher-node-{{ item }}"
-        cloud_init_path: "/tmp/cloud-init-{{ vm_name }}.yml"
-      os_server:
-        state: present
-        name: "{{ vm_name }}"
-        image: "{{ vm_image }}"
-        flavor: "{{ vm_flavor }}"
-        key_name: "{{ vm_keypair }}"
-        nics:
-          - net-id: "{{ vm_net }}"
-        userdata: "{{ lookup('file', cloud_init_path) }}"
-        auto_ip: yes
-        cloud:
-          auth:
-            auth_url: "{{ os_auth_url }}"
-            project_name: "{{ os_project_name }}"
-            project_domain_name: "{{ os_project_domain }}"
-            username: "{{ os_username }}"
-            user_domain_name: "{{ os_user_domain }}"
-            password: "{{ os_password }}"
-          region_name: "{{ os_region_name }}"
-      register: new_vm
+      loop_control:
+        label: "{{ vm_name }}"
+      block:
+        - name: Create cloud-init user_data file
+          copy:
+            dest: "{{ cloud_init_path }}"
+            content: |
+              #cloud-config
+              package_update: true
+              packages:
+                - curl
+              runcmd:
+                - curl -fsSL https://get.docker.com | sh
+                - usermod -aG docker ubuntu || true
+                - sleep 15
+                - {{ registration_command }}
 
-    - name: Show created VM details
-      debug:
-        msg: "VM rancher-node-{{ item }} created with IP {{ new_vm.results[item | int -1].server.public_v4 | default(new_vm.results[item | int -1].server.private_v4) | default('No IP assigned') }}"
-      loop: "{{ vm_list }}"
+        - name: Create VM on OpenStack with cloud-init
+          os_server:
+            state: present
+            name: "{{ vm_name }}"
+            image: "{{ vm_image }}"
+            flavor: "{{ vm_flavor }}"
+            key_name: "{{ vm_keypair }}"
+            nics:
+              - net-id: "{{ vm_net }}"
+            userdata: "{{ lookup('file', cloud_init_path) }}"
+            auto_ip: yes
+            cloud:
+              auth:
+                auth_url: "{{ os_auth_url }}"
+                project_name: "{{ os_project_name }}"
+                project_domain_name: "{{ os_project_domain }}"
+                username: "{{ os_username }}"
+                user_domain_name: "{{ os_user_domain }}"
+                password: "{{ os_password }}"
+              region_name: "{{ os_region_name }}"
+          register: new_vm
+
+        - name: Show created VM details
+          debug:
+            msg: "VM {{ vm_name }} created with IP {{ new_vm.server.public_v4 | default(new_vm.server.private_v4) | default('No IP assigned') }}"
