@@ -14,7 +14,7 @@
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
 
-    # Static values or replace with variables if needed
+    # Static values
     vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
     vm_keypair: "rke"
     os_auth_url: "http://192.168.150.31:5000/v3"
@@ -55,19 +55,19 @@
       set_fact:
         registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --etcd --controlplane --worker --label 'cattle.io/os=linux'"
 
-    - name: Create list of VM indexes
+    - name: Generate list of VM indexes
       set_fact:
         vm_list: "{{ range(1, vm_count | int + 1) | list }}"
 
-    - name: Create VMs on OpenStack
+    - name: Provision each VM
       vars:
         vm_name: "rancher-node-{{ item | string | zfill(3) }}"
-        cloud_init_path: "/tmp/cloud-init-{{ vm_name }}.yml"
+        cloud_init_path: "/tmp/cloud-init-{{ 'rancher-node-' + (item | string | zfill(3)) }}.yml"
       loop: "{{ vm_list }}"
       loop_control:
-        label: "{{ vm_name }}"
+        label: "rancher-node-{{ item | string | zfill(3) }}"
       tasks:
-        - name: Create cloud-init user_data
+        - name: Create cloud-init file
           copy:
             dest: "{{ cloud_init_path }}"
             content: |
@@ -102,6 +102,6 @@
               region_name: "{{ os_region_name }}"
           register: new_vm
 
-        - name: Show created VM details
+        - name: Show VM result
           debug:
-            msg: "VM {{ vm_name }} created with IP {{ new_vm.server.public_v4 | default(new_vm.server.private_v4) | default('No IP') }}"
+            msg: "Created VM {{ vm_name }} with IP {{ new_vm.server.public_v4 | default(new_vm.server.private_v4) | default('No IP') }}"
