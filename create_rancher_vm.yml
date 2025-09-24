@@ -1,23 +1,32 @@
 ---
-- name: Create VM on OpenStack and auto-register to Rancher (Simplified)
+- name: Provision multiple VMs on OpenStack and register to Rancher
   hosts: localhost
   connection: local
-  gather_facts: no
+  gather_facts: false
 
   vars:
-    # Rancher details
     rancher_url: "https://192.168.170.67"
     rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "openstack-cluster"
 
-    # OpenStack details
-    vm_name: "rancher-node-1"
+    # These will come from the AWX survey
+    vm_count: "{{ vm_count }}"
+    vm_net: "{{ vm_net }}"
+    vm_flavor: "{{ vm_flavor }}"
+
+    # Static values or replace with variables if needed
     vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
-    vm_flavor: "6a7bab60-adc2-4cff-8db7-6a4f1f866ac2"
     vm_keypair: "rke"
-    vm_net: "bce77acb-b609-4205-a00a-6964072d4068"
+    os_auth_url: "http://192.168.150.31:5000/v3"
+    os_project_name: "XAS"
+    os_project_domain: "Default"
+    os_username: "admin"
+    os_user_domain: "Default"
+    os_password: "2rlpcV3k3OPv"
+    os_region_name: "RegionOne"
 
   tasks:
+
     - name: Get cluster ID from Rancher
       uri:
         url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
@@ -42,44 +51,51 @@
         validate_certs: no
       register: reg_info
 
-    - name: Use the insecureNodeCommand directly from Rancher and add roles
+    - name: Extract registration command
       set_fact:
         registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --etcd --controlplane --worker --label 'cattle.io/os=linux'"
 
-    - name: Create cloud-init user_data file
-      copy:
-        dest: ./cloud-init-{{ vm_name }}.yml
-        content: |
-          #cloud-config
-          package_update: true
-          packages:
-            - curl
-          runcmd:
-            - curl -fsSL https://get.docker.com | sh
-            - usermod -aG docker ubuntu
-            - {{ registration_command }}
+    - name: Loop to create multiple VMs
+      loop: "{{ range(1, vm_count | int + 1) | list }}"
+      vars:
+        vm_name: "rancher-node-{{ item }}"
+        cloud_init_path: "/tmp/cloud-init-{{ vm_name }}.yml"
+      block:
+        - name: Create cloud-init user_data
+          copy:
+            dest: "{{ cloud_init_path }}"
+            content: |
+              #cloud-config
+              package_update: true
+              packages:
+                - curl
+              runcmd:
+                - curl -fsSL https://get.docker.com | sh
+                - usermod -aG docker ubuntu
+                - {{ registration_command }}
 
-    - name: Create VM on OpenStack with cloud-init
-      os_server:
-        state: present
-        name: "{{ vm_name }}"
-        image: "{{ vm_image }}"
-        flavor: "{{ vm_flavor }}"
-        key_name: "{{ vm_keypair }}"
-        nics:
-          - net-id: "{{ vm_net }}"
-        userdata: "{{ lookup('file', './cloud-init-' + vm_name + '.yml') }}"
-        auto_ip: yes
-        cloud:
-          auth:
-            auth_url: "http://192.168.150.31:5000/v3"
-            project_name: "XAS"
-            project_domain_name: "Default"
-            username: "admin"
-            user_domain_name: "Default"
-            password: "2rlpcV3k3OPv"
-          region_name: "RegionOne"
-      register: new_vm
+        - name: Create VM on OpenStack
+          os_server:
+            state: present
+            name: "{{ vm_name }}"
+            image: "{{ vm_image }}"
+            flavor: "{{ vm_flavor }}"
+            key_name: "{{ vm_keypair }}"
+            nics:
+              - net-id: "{{ vm_net }}"
+            userdata: "{{ lookup('file', cloud_init_path) }}"
+            auto_ip: yes
+            cloud:
+              auth:
+                auth_url: "{{ os_auth_url }}"
+                project_name: "{{ os_project_name }}"
+                project_domain_name: "{{ os_project_domain }}"
+                username: "{{ os_username }}"
+                user_domain_name: "{{ os_user_domain }}"
+                password: "{{ os_password }}"
+              region_name: "{{ os_region_name }}"
+          register: new_vm
 
-    - debug:
-        msg: "VM {{ vm_name }} created with IP {{ new_vm.server.public_v4 | default(new_vm.server.private_v4) | default('No IP assigned') }}"
+        - name: Show created VM details
+          debug:
+            msg: "VM {{ vm_name }} created with IP {{ new_vm.server.public_v4 | default(new_vm.server.private_v4) | default('No IP') }}"
