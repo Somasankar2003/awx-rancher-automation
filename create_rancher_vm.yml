@@ -14,9 +14,10 @@
     vm_count: "{{ vm_count | int }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
+    vm_image: "{{ vm_image }}"    # <-- image ID from survey
+    # Example format: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
 
     # Static VM details
-    vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
     vm_keypair: "rke"
 
     # OpenStack authentication
