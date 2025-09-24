@@ -10,7 +10,7 @@
     rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "openstack-cluster"
 
-    # Static OpenStack and VM details - replace with your defaults or pass as vars
+    # OpenStack defaults (can be overridden, but no defaults for net/flavor/count)
     vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
     vm_keypair: "rke"
     os_auth_url: "http://192.168.150.31:5000/v3"
@@ -22,14 +22,28 @@
     os_region_name: "RegionOne"
 
   tasks:
-    - name: Validate vm_count is defined and positive integer
+    - name: Fail if vm_net is not provided
       fail:
-        msg: "vm_count variable is required and must be a positive integer"
-      when: vm_count is not defined or (vm_count | int) < 1
+        msg: "vm_net must be provided (network ID)."
+      when: vm_net is not defined or vm_net == ""
 
-    - name: Generate VM list from vm_count
+    - name: Fail if vm_flavor is not provided
+      fail:
+        msg: "vm_flavor must be provided (flavor ID)."
+      when: vm_flavor is not defined or vm_flavor == ""
+
+    - name: Fail if vm_count is not provided or invalid
+      fail:
+        msg: "vm_count must be provided and be a positive integer."
+      when: vm_count is not defined or vm_count | int < 1
+
+    - name: Convert vm_count to integer
       set_fact:
-        vm_list: "{{ query('sequence', 'start=1 end=' + (vm_count | int | string)) }}"
+        vm_count: "{{ vm_count | int }}"
+
+    - name: Generate VM list
+      set_fact:
+        vm_list: "{{ query('sequence', 'start=1 end=' + vm_count|string) }}"
 
     - name: Get cluster ID from Rancher
       uri:
@@ -59,7 +73,7 @@
       set_fact:
         registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --etcd --controlplane --worker --label 'cattle.io/os=linux'"
 
-    - name: Create cloud-init user_data files for all VMs
+    - name: Create cloud-init user_data files
       loop: "{{ vm_list }}"
       vars:
         vm_name: "rancher-node-{{ item }}"
