@@ -8,16 +8,15 @@
     # Rancher details
     rancher_url: "https://192.168.170.67"
     rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
-    cluster_name: "openstack-cluster"
+    cluster_name: "{{ cluster_name }}"   # <-- From AWX survey now
 
     # Surveyed variables from AWX or CLI
     vm_count: "{{ vm_count | int }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
-    vm_image: "{{ vm_image }}"    # <-- image ID from survey
-    # Example format: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
 
     # Static VM details
+    vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"   # <-- Hardcoded back
     vm_keypair: "rke"
 
     # OpenStack authentication
