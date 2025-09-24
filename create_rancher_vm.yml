@@ -9,12 +9,12 @@
     rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "openstack-cluster"
 
-    # These will come from AWX survey
+    # These are expected to come from AWX survey
     vm_count: "{{ vm_count }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
 
-    # Static
+    # Static values (can be changed if needed)
     vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
     vm_keypair: "rke"
     os_auth_url: "http://192.168.150.31:5000/v3"
@@ -26,6 +26,13 @@
     os_region_name: "RegionOne"
 
   tasks:
+
+    - name: Validate vm_count
+      assert:
+        that:
+          - vm_count is defined
+          - vm_count | int > 0
+        fail_msg: "'vm_count' must be defined and greater than 0."
 
     - name: Get cluster ID from Rancher
       uri:
@@ -55,11 +62,11 @@
       set_fact:
         registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --etcd --controlplane --worker --label 'cattle.io/os=linux'"
 
-    - name: Generate VM list
+    - name: Generate list of VM indexes
       set_fact:
-        vm_list: "{{ range(1, vm_count | int + 1) | list }}"
+        vm_list: "{{ range(1, (vm_count | int) + 1) | list }}"
 
-    - name: Create cloud-init files
+    - name: Create cloud-init files for all VMs
       copy:
         dest: "/tmp/cloud-init-rancher-node-{{ item | string | zfill(3) }}.yml"
         content: |
@@ -73,9 +80,9 @@
             - {{ registration_command }}
       loop: "{{ vm_list }}"
       loop_control:
-        label: "cloud-init-rancher-node-{{ item | string | zfill(3) }}.yml"
+        label: "rancher-node-{{ item | string | zfill(3) }}"
 
-    - name: Launch VMs
+    - name: Create VMs on OpenStack
       os_server:
         state: present
         name: "rancher-node-{{ item | string | zfill(3) }}"
@@ -96,14 +103,12 @@
             password: "{{ os_password }}"
           region_name: "{{ os_region_name }}"
       loop: "{{ vm_list }}"
-      loop_control:
-        label: "rancher-node-{{ item | string | zfill(3) }}"
-      register: new_vms
+      register: created_vms
 
-    - name: Show results
+    - name: Show results for each VM
       debug:
         msg: >
           VM rancher-node-{{ item.item | string | zfill(3) }} created with IP {{
             item.server.public_v4 | default(item.server.private_v4) | default('No IP')
           }}
-      loop: "{{ new_vms.results }}"
+      loop: "{{ created_vms.results }}"
