@@ -10,7 +10,7 @@
     rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "openstack-cluster"
 
-    # These come from AWX survey
+    # These come from AWX survey or extra vars
     vm_count: "{{ vm_count }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
@@ -69,7 +69,7 @@
       loop_control:
         label: "{{ vm_name }}"
       block:
-        - name: Create cloud-init user_data file
+        - name: Create cloud-init user_data file with retry logic
           copy:
             dest: "{{ cloud_init_path }}"
             content: |
@@ -80,8 +80,13 @@
               runcmd:
                 - curl -fsSL https://get.docker.com | sh
                 - usermod -aG docker ubuntu || true
-                - sleep 15
-                - {{ registration_command }}
+                - sleep 30
+                - |
+                  for i in {1..10}; do
+                    {{ registration_command }} && break
+                    echo "Retrying Rancher registration in 10 seconds..."
+                    sleep 10
+                  done
 
         - name: Create VM on OpenStack with cloud-init
           os_server:
