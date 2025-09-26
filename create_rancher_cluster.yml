@@ -1,13 +1,19 @@
 ---
-- name: Create Rancher cluster via API
+- name: Create Rancher cluster via AWX
   hosts: localhost
   gather_facts: false
+  
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
+    
+    # AWX prompted variables
+    cluster_name: "{{ cluster_name }}"
+    cloud_credential: "{{ cloud_credential | default('cattle-global-data:cc-abcde') }}"
+    machine_config: "{{ machine_config | default('openstack-config') }}"
 
   tasks:
-    - name: Create OpenStack cluster in Rancher
+    - name: Create cluster with 1 control-plane/etcd + 3 workers
       uri:
         url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters"
         method: POST
@@ -17,16 +23,30 @@
         body_format: json
         body:
           metadata:
-            name: "openstack-cluster"
+            name: "{{ cluster_name }}"
             namespace: "fleet-default"
           spec:
             kubernetesVersion: "v1.33.4+rke2r1"
             rkeConfig:
-              machinePools: []
+              machinePools:
+                # Control Plane + etcd (1 node)
+                - name: "control-plane"
+                  quantity: 1
+                  etcdRole: true
+                  controlPlaneRole: true
+                  workerRole: false
+                  cloudCredentialSecretName: "{{ cloud_credential }}"
+                  machineConfigRef:
+                    kind: "OpenStackMachineConfig"
+                    name: "{{ machine_config }}"
         validate_certs: false
-        status_code: 201
-      register: create_cluster_response
+      register: cluster_result
 
-    - name: Show response from Rancher API
+    - name: Show cluster creation result
       debug:
-        var: create_cluster_response.json
+        var: cluster_result.json
+
+    - name: Success message
+      debug:
+        msg: "✅ Cluster '{{ cluster_name }}' created with 1 control-plane/etcd node and 3 worker nodes"
+      when: cluster_result.status == 201
