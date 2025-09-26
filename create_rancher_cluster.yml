@@ -5,8 +5,41 @@
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
+    cluster_name: "openstack-cluster"
 
   tasks:
+    - name: Ensure node_roles is a list (in case survey sends string)
+      set_fact:
+        node_roles_list: >-
+          {{
+            (node_roles if node_roles is sequence else (node_roles|string).split(',')) 
+            | map('trim') 
+            | list
+          }}
+
+    - name: Create machine config for pool
+      uri:
+        url: "{{ rancher_url }}/v1/rke-machine-config.cattle.io.rke2machineconfigs"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          apiVersion: rke-machine-config.cattle.io/v1
+          kind: RKE2MachineConfig
+          metadata:
+            name: "{{ pool_name }}-config"
+            namespace: fleet-default
+          # ⚠️ NOTE: Add OpenStack provider-specific fields here
+          # Example for OpenStack might look like:
+          # flavor: "m1.medium"
+          # image: "ubuntu-22.04"
+          # cloudConfigSecretName: "openstack-cloud-secret"
+        validate_certs: false
+        status_code: 201,409   # 201 created, 409 if already exists
+      register: machine_config_response
+
     - name: Create OpenStack cluster in Rancher
       uri:
         url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters"
@@ -16,16 +49,22 @@
           Content-Type: "application/json"
         body_format: json
         body:
+          apiVersion: provisioning.cattle.io/v1
+          kind: Cluster
           metadata:
-            name: "openstack-cluster"
-            namespace: "fleet-default"
+            name: "{{ cluster_name }}"
+            namespace: fleet-default
           spec:
             kubernetesVersion: "v1.33.1+rke2r1"
             rkeConfig:
               machinePools:
                 - name: "{{ pool_name }}"
                   quantity: "{{ node_count | int }}"
-                  roles: "{{ node_roles }}"
+                  roles: "{{ node_roles_list }}"
+                  machineConfigRef:
+                    kind: RKE2MachineConfig
+                    apiVersion: rke-machine-config.cattle.io/v1
+                    name: "{{ pool_name }}-config"
         validate_certs: false
         status_code: 201
       register: create_cluster_response
