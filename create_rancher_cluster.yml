@@ -21,18 +21,13 @@
             namespace: "fleet-default"
           spec:
             kubernetesVersion: "v1.33.4+rke2r1"
-            cloudCredentialSecretName: "cattle-global-data:cc-abcde"  # Your cloud credential
             rkeConfig:
               machinePools:
-                - name: "all-in-one"
-                  quantity: 1
-                  etcdRole: true
-                  controlPlaneRole: true
-                  workerRole: true
-                  machineConfigRef:
-                    kind: "VmwarevsphereMachineConfig"  # Use a supported kind or remove
-                    name: "default-config"
+                - name: "{{ pool_name }}"
+                  quantity: "{{ node_count | int }}"
+                  roles: "{{ node_roles }}"
         validate_certs: false
+        status_code: 201
       register: create_cluster_response
 
     - name: Show response from Rancher API
