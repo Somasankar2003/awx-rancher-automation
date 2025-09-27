@@ -1,4 +1,4 @@
-- name: Get Rancher cluster registration command
+- name: Get Rancher cluster registration command with node roles
   hosts: localhost
   gather_facts: false
   vars:
@@ -26,14 +26,7 @@
       set_fact:
         cluster_id: "{{ cluster_list_response.json.data[0].id }}"
 
-    - name: Debug cluster info
-      debug:
-        msg:
-          - "Cluster ID: {{ cluster_id }}"
-          - "Cluster Name: {{ cluster_list_response.json.data[0].name }}"
-          - "Cluster State: {{ cluster_list_response.json.data[0].state }}"
-
-    - name: Create new registration token
+    - name: Create new registration token with node roles
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
         method: POST
@@ -43,17 +36,13 @@
         body_format: json
         body:
           clusterId: "{{ cluster_id }}"
+          # Specify node roles in the token creation
+          nodeCommand: true
         validate_certs: false
         status_code: 201
       register: token_response
 
-    - name: Debug token creation response
-      debug:
-        msg:
-          - "Token ID: {{ token_response.json.id }}"
-          - "Token created successfully"
-
-    - name: Wait for token to be ready with full output
+    - name: Wait for token to be ready
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens/{{ token_response.json.id }}"
         method: GET
@@ -67,32 +56,34 @@
       retries: 15
       delay: 5
 
-    - name: Display ALL available fields in token response
+    - name: Debug the full token response
       debug:
         var: final_token.json
 
-    - name: Extract and clean the insecureNodeCommand
+    - name: Extract the insecureNodeCommand
       set_fact:
-        registration_cmd: "{{ final_token.json.insecureNodeCommand | trim | replace('  ', ' ') }}"
+        registration_cmd: "{{ final_token.json.insecureNodeCommand | trim }}"
 
-    - name: Extract available fields safely
+    - name: Check if roles are missing and add them
       set_fact:
-        manual_token: "{{ final_token.json.token }}"
-        # Try different possible field names for CA checksum
-        manual_ca_checksum: "{{ final_token.json.clusterCaChecksum | default(final_token.json.caChecksum | default(final_token.json.caChecksum | default('UNKNOWN'))) }}"
+        final_registration_cmd: "{{ registration_cmd }} --etcd --controlplane --worker"
+      when: "'--etcd' not in registration_cmd"
 
-    - name: Debug extracted fields
-      debug:
-        msg:
-          - "Token: {{ manual_token }}"
-          - "CA Checksum: {{ manual_ca_checksum }}"
-          - "Available keys: {{ final_token.json.keys() | list }}"
-
-    - name: Use the Rancher-generated command (most reliable)
+    - name: Use original command if roles are already included
       set_fact:
         final_registration_cmd: "{{ registration_cmd }}"
+      when: "'--etcd' in registration_cmd"
 
-    - name: Create registration script file
+    - name: Debug command length and content
+      debug:
+        msg:
+          - "Original command length: {{ registration_cmd | length }}"
+          - "Final command length: {{ final_registration_cmd | length }}"
+          - "Contains --etcd: {{ '--etcd' in final_registration_cmd }}"
+          - "Contains --controlplane: {{ '--controlplane' in final_registration_cmd }}"
+          - "Contains --worker: {{ '--worker' in final_registration_cmd }}"
+
+    - name: Create registration script file with roles
       copy:
         content: |
           #!/bin/bash
@@ -101,6 +92,7 @@
           
           echo "Registering node with cluster: {{ cluster_name }}"
           echo "Cluster ID: {{ cluster_id }}"
+          echo "Node roles: etcd, controlplane, worker"
           echo ""
           
           {{ final_registration_cmd }}
@@ -116,42 +108,22 @@
         dest: "./register-{{ cluster_name }}.sh"
         mode: '0755'
 
-    - name: Create one-line command file
-      copy:
-        content: "{{ final_registration_cmd }}"
-        dest: "./register-{{ cluster_name }}-oneline.sh"
-        mode: '0755'
-
-    - name: Display success message with full command
+    - name: Display the complete registration command
       debug:
         msg: |
-          ✅ REGISTRATION COMMAND GENERATED SUCCESSFULLY!
-          ==============================================
-          
-          📋 CLUSTER INFORMATION:
-          - Cluster Name: {{ cluster_name }}
-          - Cluster ID: {{ cluster_id }}
-          - Token: {{ manual_token }}
-          - CA Checksum: {{ manual_ca_checksum }}
-          
-          📁 FILES CREATED:
-          1. ./register-{{ cluster_name }}.sh - Full script with comments
-          2. ./register-{{ cluster_name }}-oneline.sh - One-line command
+          ✅ COMPLETE REGISTRATION COMMAND GENERATED!
+          ==========================================
           
           🔧 REGISTRATION COMMAND:
           {{ final_registration_cmd }}
           
-          📖 USAGE INSTRUCTIONS:
-          1. Make script executable: chmod +x register-{{ cluster_name }}.sh
-          2. Run on each node: ./register-{{ cluster_name }}.sh
-          3. Or use one-line: ./register-{{ cluster_name }}-oneline.sh
-          4. Monitor progress in Rancher UI
-
-    - name: Verify command matches expected format
-      debug:
-        msg: |
-          ✅ VERIFICATION PASSED!
-          - Command starts with: {{ final_registration_cmd.startswith('curl --insecure -fL') }}
-          - Contains server URL: {{ rancher_url in final_registration_cmd }}
-          - Contains token: {{ manual_token in final_registration_cmd }}
-          - Command length: {{ final_registration_cmd | length }} characters
+          📏 COMMAND LENGTH: {{ final_registration_cmd | length }} characters
+          
+          ✅ INCLUDES NODE ROLES: 
+          - etcd: {{ '--etcd' in final_registration_cmd }}
+          - controlplane: {{ '--controlplane' in final_registration_cmd }} 
+          - worker: {{ '--worker' in final_registration_cmd }}
+          
+          📁 Script created: ./register-{{ cluster_name }}.sh
+          
+          🚀 Ready to use on your nodes!
