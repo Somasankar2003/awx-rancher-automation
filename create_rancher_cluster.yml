@@ -11,7 +11,7 @@
     # Hardcoded cluster name
     cluster_name: "openstack-cluster"
 
-    # These still come from AWX survey or CLI
+    # These should come from AWX survey or CLI
     node_roles: "{{ node_roles }}"             # e.g. "etcd,controlplane,worker"
     node_count: "{{ node_count | int }}"       # e.g. 3
     pool_name: "{{ pool_name }}"               # e.g. "default-pool"
@@ -22,14 +22,9 @@
         cluster_payload:
           type: cluster
           name: "{{ cluster_name }}"
-          customClusterConfig:
-            rancherKubernetesEngineConfig:
-              machinePools:
-                - name: "{{ pool_name }}"
-                  nodeCount: "{{ node_count }}"
-                  roles: "{{ node_roles.split(',') }}"
+          customClusterConfig: {}
 
-    - name: Create cluster in Rancher
+    - name: Create custom cluster in Rancher
       uri:
         url: "{{ rancher_url }}/v3/clusters"
         method: POST
@@ -39,9 +34,48 @@
         body: "{{ cluster_payload | to_json }}"
         body_format: json
         validate_certs: no
-        status_code: [201, 409]  # 409 = cluster already exists
-      register: result
+        status_code: [201, 409]  # 409 means cluster already exists
+      register: cluster_result
 
-    - name: Show result
+    - name: Show result of cluster creation
       debug:
-        var: result.json
+        var: cluster_result.json
+
+    - name: Get cluster ID
+      uri:
+        url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+          Content-Type: "application/json"
+        validate_certs: no
+      register: cluster_info
+
+    - name: Set cluster ID
+      set_fact:
+        cluster_id: "{{ cluster_info.json.data[0].id }}"
+
+    - name: Update machine pools on the cluster (roles, pool name, node count)
+      uri:
+        url: "{{ rancher_url }}/v3/cluster/{{ cluster_id }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          id: "{{ cluster_id }}"
+          name: "{{ cluster_name }}"
+          customClusterConfig:
+            rancherKubernetesEngineConfig:
+              machinePools:
+                - name: "{{ pool_name }}"
+                  nodeCount: "{{ node_count }}"
+                  roles: "{{ node_roles.split(',') }}"
+        validate_certs: no
+        status_code: 200
+      register: update_result
+
+    - name: Show result of machinePool update
+      debug:
+        var: update_result.json
