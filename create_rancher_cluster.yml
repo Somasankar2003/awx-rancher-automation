@@ -4,18 +4,22 @@
   gather_facts: false
 
   vars:
-    # Hardcoded or template-level vars
+    # Rancher Configuration
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
+
+    # Cluster Details
     cluster_name: "openstack-cluster"
-    kubernetes_version: "v1.33.1+rke2r1"   # Adjust if needed
+    kubernetes_version: "v1.33.4+rke2r1"
+    pool_name: "default-pool"          # <-- Now defined here
+    # node_roles and node_count should still come from AWX or CLI extra-vars
 
   tasks:
     - name: Validate node_roles is a list
       assert:
         that:
           - node_roles is iterable
-        fail_msg: "node_roles must be a list (use 'Multiple Choice' in AWX survey)."
+        fail_msg: "node_roles must be a list (set as Multiple Choice in AWX survey)"
         success_msg: "node_roles is a valid list."
 
     - name: Create OpenStack cluster in Rancher (Custom Cluster)
