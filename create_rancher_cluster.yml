@@ -1,81 +1,55 @@
 ---
-- name: Create Rancher Custom Provider Cluster
+- name: Create Rancher Custom Cluster via API
   hosts: localhost
-  gather_facts: no
+  gather_facts: false
 
   vars:
-    # Rancher connection details
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
-
-    # Hardcoded cluster name
     cluster_name: "openstack-cluster"
-
-    # These should come from AWX survey or CLI
-    node_roles: "{{ node_roles }}"             # e.g. "etcd,controlplane,worker"
-    node_count: "{{ node_count | int }}"       # e.g. 3
-    pool_name: "{{ pool_name }}"               # e.g. "default-pool"
+    kubernetes_version: "v1.33.1+rke2r1"   # You may adjust based on Rancher availability
 
   tasks:
-    - name: Prepare cluster payload
+    - name: Ensure node_roles is a list (in case survey sends string)
       set_fact:
-        cluster_payload:
-          type: cluster
-          name: "{{ cluster_name }}"
-          customClusterConfig: {}
+        node_roles_list: >-
+          {{ (node_roles if node_roles is sequence else (node_roles|string).split(',')) | map('trim') | list }}
 
-    - name: Create custom cluster in Rancher
+    - name: Create OpenStack cluster in Rancher (Custom Cluster)
       uri:
-        url: "{{ rancher_url }}/v3/clusters"
+        url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters"
         method: POST
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-          Content-Type: "application/json"
-        body: "{{ cluster_payload | to_json }}"
-        body_format: json
-        validate_certs: no
-        status_code: [201, 409]  # 409 means cluster already exists
-      register: cluster_result
-
-    - name: Show result of cluster creation
-      debug:
-        var: cluster_result.json
-
-    - name: Get cluster ID
-      uri:
-        url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-          Content-Type: "application/json"
-        validate_certs: no
-      register: cluster_info
-
-    - name: Set cluster ID
-      set_fact:
-        cluster_id: "{{ cluster_info.json.data[0].id }}"
-
-    - name: Update machine pools on the cluster (roles, pool name, node count)
-      uri:
-        url: "{{ rancher_url }}/v3/cluster/{{ cluster_id }}"
-        method: PUT
         headers:
           Authorization: "Bearer {{ api_token }}"
           Content-Type: "application/json"
         body_format: json
         body:
-          id: "{{ cluster_id }}"
-          name: "{{ cluster_name }}"
-          customClusterConfig:
-            rancherKubernetesEngineConfig:
+          apiVersion: provisioning.cattle.io/v1
+          kind: Cluster
+          metadata:
+            name: "{{ cluster_name }}"
+            namespace: fleet-default
+          spec:
+            kubernetesVersion: "{{ kubernetes_version }}"
+            rkeConfig:
               machinePools:
                 - name: "{{ pool_name }}"
-                  nodeCount: "{{ node_count }}"
-                  roles: "{{ node_roles.split(',') }}"
-        validate_certs: no
-        status_code: 200
-      register: update_result
+                  quantity: "{{ node_count | int }}"
+                  roles: "{{ node_roles_list }}"
+                  displayName: "{{ pool_name }}"
+                  hostnamePrefix: "{{ cluster_name }}-node"
+                  machineConfigRef:
+                    kind: MachineConfig
+                    name: "{{ pool_name }}"
+              chartValues:
+                rke2-coredns: {}
+                rke2-ingress-nginx: {}
+                rke2-kube-proxy: {}
+                rke2-metrics-server: {}
+        validate_certs: false
+        status_code: 201
+      register: create_cluster_response
 
-    - name: Show result of machinePool update
+    - name: Show Rancher API response
       debug:
-        var: update_result.json
+        var: create_cluster_response.json
