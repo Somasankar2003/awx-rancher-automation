@@ -9,33 +9,46 @@
     kubernetes_version: "v1.33.1+rke2r1"
 
   tasks:
-    - name: Display survey inputs
+    - name: Display raw survey inputs
       debug:
         msg:
-          - "Survey Variables Received:"
-          - "node_count: {{ node_count }}"
-          - "node_roles: {{ node_roles }}"
-          - "node_roles length: {{ node_roles | length }}"
+          - "Raw node_count: {{ node_count }}"
+          - "Raw node_roles: {{ node_roles }}"
+          - "Type: {{ node_roles | type_debug }}"
 
-    - name: Validate node_roles is a list
+    - name: Fix node_roles format (handle comma-separated string in list)
+      set_fact:
+        actual_node_roles: "{{ (node_roles | first).split(',') if node_roles is iterable and node_roles | first is string and ',' in node_roles | first else node_roles }}"
+
+    - name: Display corrected values
+      debug:
+        msg:
+          - "Corrected node_roles: {{ actual_node_roles }}"
+          - "Type: {{ actual_node_roles | type_debug }}"
+          - "Contains etcd: {{ 'etcd' in actual_node_roles }}"
+          - "Contains controlplane: {{ 'controlplane' in actual_node_roles }}"
+          - "Contains worker: {{ 'worker' in actual_node_roles }}"
+
+    - name: Validate node_roles format
       assert:
         that:
-          - node_roles is iterable
-          - node_roles | length > 0
-        fail_msg: "node_roles must be a non-empty list. Check AWX survey configuration."
-        success_msg: "node_roles is a valid list"
+          - actual_node_roles is iterable
+          - actual_node_roles | length > 0
+          - "'etcd' in actual_node_roles or 'controlplane' in actual_node_roles or 'worker' in actual_node_roles"
+        fail_msg: "node_roles must contain valid roles. Current format: {{ node_roles }}"
+        success_msg: "node_roles format is correct"
 
     - name: Validate configuration
       assert:
         that:
           - node_count | int >= 1
           - node_count | int <= 20
-          - ("etcd" in node_roles and node_count | int >= 3) or "etcd" not in node_roles
+          - ("etcd" in actual_node_roles and node_count | int >= 3) or "etcd" not in actual_node_roles
         fail_msg: |
           Invalid configuration:
-          - node_count must be between 1-20
-          - If etcd role is selected, need minimum 3 nodes for HA
-        success_msg: "Configuration validated successfully"
+          - Need minimum 3 nodes if etcd role is selected
+          - Current: {{ node_count }} nodes with etcd role
+        success_msg: "Configuration validated"
 
     - name: Create custom cluster in Rancher
       uri:
@@ -57,6 +70,34 @@
         status_code: 201
       register: create_cluster_response
 
+    - name: Wait for cluster to be ready
+      uri:
+        url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters/fleet-default/{{ cluster_name }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+        validate_certs: false
+        status_code: 200
+      register: cluster_status
+      until: cluster_status.json.status.clusterName is defined
+      retries: 30
+      delay: 10
+
+    - name: Get the correct cluster ID from v3 API
+      uri:
+        url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+        validate_certs: false
+        status_code: 200
+      register: v3_cluster_info
+
+    - name: Extract cluster ID
+      set_fact:
+        cluster_id: "{{ v3_cluster_info.json.data[0].id }}"
+      when: v3_cluster_info.json.data | length > 0
+
     - name: Create cluster registration token
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
@@ -66,7 +107,8 @@
           Content-Type: "application/json"
         body_format: json
         body:
-          clusterId: "{{ cluster_name }}"
+          clusterId: "{{ cluster_id }}"
+          type: "clusterRegistrationToken"
         validate_certs: false
         status_code: 201
       register: token_response
@@ -82,25 +124,22 @@
       register: final_token
       until: final_token.json.nodeCommand is defined
       retries: 10
-      delay: 3
+      delay: 5
 
     - name: Display cluster creation results
       debug:
         msg:
           - "✅ CLUSTER CREATED SUCCESSFULLY!"
           - "Cluster Name: {{ cluster_name }}"
-          - "Kubernetes Version: {{ kubernetes_version }}"
           - "Total Nodes to Register: {{ node_count }}"
-          - "Roles for Each Node: {{ node_roles }}"
+          - "Roles for Each Node: {{ actual_node_roles }}"
           - ""
-          - "📋 REGISTRATION COMMAND (run this on each node):"
+          - "📋 REGISTRATION COMMAND:"
           - "{{ final_token.json.nodeCommand }}"
           - ""
-          - "🔧 MANUAL STEPS REQUIRED:"
-          - "1. Provision {{ node_count }} nodes in your infrastructure"
-          - "2. SSH into each node and run the registration command above"
-          - "3. Wait for nodes to appear in Rancher UI"
-          - "4. Cluster will be ready when all {{ node_count }} nodes are registered"
+          - "🔧 MANUAL STEPS:"
+          - "1. Run the command on {{ node_count }} nodes"
+          - "2. All nodes will have roles: {{ actual_node_roles }}"
 
     - name: Save registration info to file
       copy:
@@ -108,16 +147,10 @@
           Cluster Registration Information
           ================================
           Cluster Name: {{ cluster_name }}
-          Date: {{ ansible_date_time.iso8601 }}
           Node Count: {{ node_count }}
-          Node Roles: {{ node_roles }}
+          Node Roles: {{ actual_node_roles }}
           
           Registration Command:
           {{ final_token.json.nodeCommand }}
-          
-          Instructions:
-          1. Run the above command on {{ node_count }} nodes
-          2. Ensure nodes can reach {{ rancher_url }}
-          3. Monitor progress in Rancher UI
         dest: "/tmp/{{ cluster_name }}-registration.txt"
       delegate_to: localhost
