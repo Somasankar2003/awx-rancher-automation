@@ -1,133 +1,43 @@
-- name: Create Rancher Custom Cluster via API (Provisioning v1) with AWX Survey
+- name: Create Rancher Custom Cluster
   hosts: localhost
   gather_facts: false
 
   vars:
-    # Rancher Configuration
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
-
-    # Cluster Details
     cluster_name: "custom-cluster"
     kubernetes_version: "v1.33.1+rke2r1"
 
   tasks:
-    - name: Validate survey variables
-      assert:
-        that:
-          - node_roles is defined
-          - node_count is defined
-          - node_roles is iterable
-          - node_count | int > 0
-        fail_msg: "Please provide valid node_roles (list) and node_count (positive integer) via AWX survey"
-        success_msg: "Survey variables validated successfully"
-
     - name: Display survey inputs
       debug:
         msg:
-          - "Cluster Name: {{ cluster_name }}"
-          - "Kubernetes Version: {{ kubernetes_version }}"
-          - "Node Roles: {{ node_roles }}"
-          - "Node Count: {{ node_count }}"
+          - "Survey Variables Received:"
+          - "node_count: {{ node_count }}"
+          - "node_roles: {{ node_roles }}"
+          - "Type of node_roles: {{ node_roles | type }}"
 
-    - name: Create Custom Cluster in Rancher (without machinePools)
+    - name: Validate node_roles is a list
+      assert:
+        that:
+          - node_roles is iterable
+        fail_msg: "node_roles must be a list. Check AWX survey configuration."
+        success_msg: "node_roles is a valid list"
+
+    - name: Validate configuration
+      assert:
+        that:
+          - node_count | int >= 1
+          - node_count | int <= 20
+          - ("etcd" in node_roles and node_count | int >= 3) or "etcd" not in node_roles
+        fail_msg: |
+          Invalid configuration:
+          - node_count must be between 1-20
+          - If etcd role is selected, need minimum 3 nodes for HA
+        success_msg: "Configuration validated successfully"
+
+    - name: Create cluster
       uri:
         url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters"
         method: POST
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          apiVersion: provisioning.cattle.io/v1
-          kind: Cluster
-          metadata:
-            name: "{{ cluster_name }}"
-            namespace: fleet-default
-          spec:
-            kubernetesVersion: "{{ kubernetes_version }}"
-            # NO machinePools for custom clusters - nodes are added manually
-        validate_certs: false
-        status_code: 201
-      register: create_cluster_response
-
-    - name: Show Rancher API response
-      debug:
-        var: create_cluster_response.json
-
-    - name: Wait for cluster to be created
-      uri:
-        url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters/fleet-default/{{ cluster_name }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-        validate_certs: false
-        status_code: 200
-      register: cluster_status
-      until: cluster_status.json.status.clusterName is defined
-      retries: 12
-      delay: 10
-
-    - name: Create cluster registration token
-      uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          clusterId: "{{ cluster_name }}"
-        validate_certs: false
-        status_code: 201
-      register: registration_token
-
-    - name: Wait for token to be ready and get registration command
-      uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens/{{ registration_token.json.id }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-        validate_certs: false
-        status_code: 200
-      register: token_info
-      until: token_info.json.nodeCommand is defined
-      retries: 10
-      delay: 5
-
-    - name: Display cluster creation summary
-      debug:
-        msg:
-          - "✓ Custom cluster '{{ cluster_name }}' created successfully!"
-          - "Cluster ID: {{ cluster_status.json.id }}"
-          - "Current State: {{ cluster_status.json.state }}"
-          - ""
-          - "NODE REGISTRATION INSTRUCTIONS:"
-          - "================================"
-          - "Number of nodes to register: {{ node_count }}"
-          - "Node roles required: {{ node_roles }}"
-          - ""
-          - "Registration Command:"
-          - "{{ token_info.json.nodeCommand }}"
-          - ""
-          - "Manual Steps Required:"
-          - "1. Provision {{ node_count }} nodes in your infrastructure"
-          - "2. Run the above command on each node"
-          - "3. Ensure nodes have the correct roles: {{ node_roles }}"
-          - "4. Wait for all nodes to register in Rancher UI"
-
-    - name: Save registration command to file (optional)
-      copy:
-        content: |
-          Cluster Name: {{ cluster_name }}
-          Node Count: {{ node_count }}
-          Node Roles: {{ node_roles }}
-          Registration Command:
-          {{ token_info.json.nodeCommand }}
-          
-          Instructions:
-          1. Run this command on each of the {{ node_count }} nodes
-          2. Ensure nodes have network connectivity to Rancher server
-          3. Monitor registration in Rancher UI
-        dest: "/tmp/{{ cluster_name }}-registration.txt"
-      delegate_to: localhost
+        # ... rest of cluster creation code
