@@ -1,4 +1,4 @@
-- name: Create Rancher Custom Cluster
+- name: Create True Rancher Custom Cluster (Imported Cluster)
   hosts: localhost
   gather_facts: false
 
@@ -9,34 +9,16 @@
     kubernetes_version: "v1.33.1+rke2r1"
 
   tasks:
-    - name: Display raw survey inputs
+    - name: Display survey inputs
       debug:
         msg:
-          - "Raw node_count: {{ node_count }}"
-          - "Raw node_roles: {{ node_roles }}"
-          - "Type: {{ node_roles | type_debug }}"
+          - "Creating TRUE custom cluster: {{ cluster_name }}"
+          - "Node Count: {{ node_count }}"
+          - "Node Roles: {{ node_roles }}"
 
-    - name: Fix node_roles format (handle comma-separated string in list)
+    - name: Fix node_roles format
       set_fact:
         actual_node_roles: "{{ (node_roles | first).split(',') if node_roles is iterable and node_roles | first is string and ',' in node_roles | first else node_roles }}"
-
-    - name: Display corrected values
-      debug:
-        msg:
-          - "Corrected node_roles: {{ actual_node_roles }}"
-          - "Type: {{ actual_node_roles | type_debug }}"
-          - "Contains etcd: {{ 'etcd' in actual_node_roles }}"
-          - "Contains controlplane: {{ 'controlplane' in actual_node_roles }}"
-          - "Contains worker: {{ 'worker' in actual_node_roles }}"
-
-    - name: Validate node_roles format
-      assert:
-        that:
-          - actual_node_roles is iterable
-          - actual_node_roles | length > 0
-          - "'etcd' in actual_node_roles or 'controlplane' in actual_node_roles or 'worker' in actual_node_roles"
-        fail_msg: "node_roles must contain valid roles. Current format: {{ node_roles }}"
-        success_msg: "node_roles format is correct"
 
     - name: Validate configuration
       assert:
@@ -47,73 +29,58 @@
         fail_msg: |
           Invalid configuration:
           - Need minimum 3 nodes if etcd role is selected
-          - Current: {{ node_count }} nodes with etcd role
         success_msg: "Configuration validated"
 
-    - name: Create custom cluster in Rancher
+    - name: Create custom cluster using v3 API (NOT provisioning API)
       uri:
-        url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters"
+        url: "{{ rancher_url }}/v3/clusters"
         method: POST
         headers:
           Authorization: "Bearer {{ api_token }}"
           Content-Type: "application/json"
         body_format: json
         body:
-          apiVersion: provisioning.cattle.io/v1
-          kind: Cluster
-          metadata:
-            name: "{{ cluster_name }}"
-            namespace: fleet-default
-          spec:
-            kubernetesVersion: "{{ kubernetes_version }}"
+          name: "{{ cluster_name }}"
+          type: "cluster"
+          labels: {}
+          annotations: {}
         validate_certs: false
         status_code: 201
       register: create_cluster_response
 
-    - name: Wait for cluster to be ready
+    - name: Display cluster creation response
+      debug:
+        var: create_cluster_response.json
+
+    - name: Wait for cluster to be created
       uri:
-        url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters/fleet-default/{{ cluster_name }}"
+        url: "{{ rancher_url }}/v3/clusters/{{ create_cluster_response.json.id }}"
         method: GET
         headers:
           Authorization: "Bearer {{ api_token }}"
         validate_certs: false
         status_code: 200
-      register: cluster_status
-      until: cluster_status.json.status.clusterName is defined
+      register: cluster_info
+      until: cluster_info.json.state == "active"
       retries: 30
-      delay: 10
+      delay: 5
 
-    - name: Get the correct cluster ID from v3 API
+    - name: Get node registration command for CUSTOM cluster
       uri:
-        url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-        validate_certs: false
-        status_code: 200
-      register: v3_cluster_info
-
-    - name: Extract cluster ID
-      set_fact:
-        cluster_id: "{{ v3_cluster_info.json.data[0].id }}"
-      when: v3_cluster_info.json.data | length > 0
-
-    - name: Create cluster registration token
-      uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
+        url: "{{ rancher_url }}/v3/clusters/{{ create_cluster_response.json.id }}/clusterregistrationtokens"
         method: POST
         headers:
           Authorization: "Bearer {{ api_token }}"
           Content-Type: "application/json"
         body_format: json
         body:
-          clusterId: "{{ cluster_id }}"
           type: "clusterRegistrationToken"
+          clusterId: "{{ create_cluster_response.json.id }}"
         validate_certs: false
         status_code: 201
       register: token_response
 
-    - name: Wait for registration token to be ready
+    - name: Wait for token to be ready
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens/{{ token_response.json.id }}"
         method: GET
@@ -124,33 +91,47 @@
       register: final_token
       until: final_token.json.nodeCommand is defined
       retries: 10
-      delay: 5
+      delay: 3
 
-    - name: Display cluster creation results
+    - name: Display TRUE CUSTOM CLUSTER registration command
       debug:
         msg:
-          - "✅ CLUSTER CREATED SUCCESSFULLY!"
+          - "✅ TRUE CUSTOM CLUSTER CREATED SUCCESSFULLY!"
           - "Cluster Name: {{ cluster_name }}"
+          - "Cluster ID: {{ create_cluster_response.json.id }}"
+          - "Cluster Type: {{ create_cluster_response.json.type }}"
           - "Total Nodes to Register: {{ node_count }}"
           - "Roles for Each Node: {{ actual_node_roles }}"
           - ""
-          - "📋 REGISTRATION COMMAND:"
+          - "📋 CUSTOM CLUSTER REGISTRATION COMMAND (RKE/K3s):"
           - "{{ final_token.json.nodeCommand }}"
           - ""
-          - "🔧 MANUAL STEPS:"
-          - "1. Run the command on {{ node_count }} nodes"
-          - "2. All nodes will have roles: {{ actual_node_roles }}"
+          - "🔧 MANUAL KUBERNETES INSTALLATION REQUIRED:"
+          - "1. Install Kubernetes (RKE2/K3s) manually on {{ node_count }} nodes"
+          - "2. THEN run the registration command above on each node"
+          - "3. This is a TRUE custom cluster - you manage Kubernetes installation"
+          - "4. Nodes should have roles: {{ actual_node_roles }}"
 
-    - name: Save registration info to file
+    - name: Save custom cluster registration info
       copy:
         content: |
-          Cluster Registration Information
-          ================================
+          TRUE CUSTOM CLUSTER Registration Information
+          ============================================
           Cluster Name: {{ cluster_name }}
+          Cluster ID: {{ create_cluster_response.json.id }}
+          Cluster Type: Imported Custom Cluster
           Node Count: {{ node_count }}
           Node Roles: {{ actual_node_roles }}
           
-          Registration Command:
+          IMPORTANT: This is a CUSTOM cluster where YOU install Kubernetes.
+          
+          Steps:
+          1. Install RKE2 or K3s manually on {{ node_count }} nodes
+          2. Configure nodes with roles: {{ actual_node_roles }}
+          3. Run this registration command on each node:
+          
           {{ final_token.json.nodeCommand }}
-        dest: "/tmp/{{ cluster_name }}-registration.txt"
+          
+          4. Nodes will appear as 'Imported' in Rancher
+        dest: "/tmp/{{ cluster_name }}-custom-cluster-registration.txt"
       delegate_to: localhost
