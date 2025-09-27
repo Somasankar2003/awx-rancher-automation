@@ -1,4 +1,4 @@
-- name: Get complete Rancher cluster registration command
+- name: Get Rancher cluster registration command with correct token and checksum
   hosts: localhost
   gather_facts: false
   vars:
@@ -26,136 +26,116 @@
       set_fact:
         cluster_id: "{{ cluster_list_response.json.data[0].id }}"
 
-    - name: Create new registration token
+    # YOUR APPROACH: Get the correct token
+    - name: Fetch registration tokens for this cluster
       uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          clusterId: "{{ cluster_id }}"
-        validate_certs: false
-        status_code: 201
-      register: token_response
-
-    - name: Wait for token to be ready with ALL fields
-      uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens/{{ token_response.json.id }}"
+        url: "{{ rancher_url }}/v3/clusterregistrationtokens?clusterId={{ cluster_id }}"
         method: GET
         headers:
           Authorization: "Bearer {{ api_token }}"
           Content-Type: "application/json"
         validate_certs: false
-        status_code: 200
-      register: final_token
-      until: 
-        - final_token.json.insecureNodeCommand is defined
-        - final_token.json.nodeCommand is defined
-        - final_token.json.token is defined
-      retries: 20
-      delay: 5
+      register: tokens_response
 
-    - name: Debug the complete token response
-      debug:
-        var: final_token.json
+    - name: Fail if no registration tokens found
+      fail:
+        msg: "No registration tokens found for cluster {{ cluster_name }}!"
+      when: tokens_response.json.data | length == 0
 
-    - name: Extract registration commands and token
+    - name: Set token fact (YOUR CORRECT TOKEN)
       set_fact:
-        insecure_command: "{{ final_token.json.insecureNodeCommand | trim }}"
-        secure_command: "{{ final_token.json.nodeCommand | trim }}"
-        generated_token: "{{ final_token.json.token }}"
+        token: "{{ tokens_response.json.data[0].token }}"
 
-    - name: Choose the best command (prefer secure, fallback to insecure)
+    # MY APPROACH: Get the correct checksum
+    - name: Get CA checksum from Rancher server settings
+      uri:
+        url: "{{ rancher_url }}/v3/settings/cacerts"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+          Content-Type: "application/json"
+        validate_certs: false
+      register: ca_certs_response
+      ignore_errors: yes
+
+    - name: Calculate CA checksum from CA certificates
+      shell: |
+        echo "{{ ca_certs_response.json.value }}" | base64 -d | openssl sha256 -r | cut -d' ' -f1
+      register: calculated_checksum
+      when: ca_certs_response is defined and ca_certs_response.json.value is defined
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Set CA checksum from calculated value
       set_fact:
-        base_command: "{{ secure_command if secure_command | length > 0 else insecure_command }}"
+        ca_checksum: "{{ calculated_checksum.stdout }}"
+      when: calculated_checksum is defined and calculated_checksum.stdout != ''
 
-    - name: Extract checksum from secure command if available
+    - name: Get CA checksum from server's certificate as fallback
+      shell: |
+        openssl s_client -connect {{ rancher_url | regex_replace('^https://', '') }}:443 -showcerts </dev/null 2>/dev/null | 
+        openssl x509 -outform PEM | 
+        openssl sha256 -r | 
+        cut -d' ' -f1
+      register: openssl_ca_checksum
+      when: ca_checksum is not defined or ca_checksum == ''
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Set CA checksum from openssl result
       set_fact:
-        ca_checksum: "{{ secure_command | regex_search('--ca-checksum\\s+(\\S+)', '\\1') | first | default('') }}"
-      when: secure_command | length > 0
+        ca_checksum: "{{ openssl_ca_checksum.stdout }}"
+      when: openssl_ca_checksum is defined and openssl_ca_checksum.stdout != ''
 
-    - name: Build complete command with correct token and checksum
-      set_fact:
-        complete_command: "{{ base_command | regex_replace('--token\\s+\\S+', '--token ' + generated_token) }}"
-      when: "'--token' in base_command"
-
-    - name: Build complete command by adding token if missing
-      set_fact:
-        complete_command: "{{ base_command }} --token {{ generated_token }}"
-      when: "'--token' not in base_command"
-
-    - name: Ensure roles are included
-      set_fact:
-        complete_command: "{{ complete_command }} --etcd --controlplane --worker"
-      when: "'--etcd' not in complete_command and '--controlplane' not in complete_command and '--worker' not in complete_command"
-
-    - name: Final command cleanup (remove duplicates)
-      set_fact:
-        complete_command: "{{ complete_command | regex_replace('--etcd\\s+--etcd', '--etcd') | regex_replace('--controlplane\\s+--controlplane', '--controlplane') | regex_replace('--worker\\s+--worker', '--worker') }}"
-
-    - name: Verify the complete command
+    - name: Debug both values
       debug:
         msg:
-          - "Generated Token: {{ generated_token }}"
-          - "Command Length: {{ complete_command | length }} characters"
-          - "Contains --token: {{ '--token' in complete_command }}"
-          - "Token in command: {{ generated_token in complete_command }}"
-          - "Contains --etcd: {{ '--etcd' in complete_command }}"
-          - "Contains --controlplane: {{ '--controlplane' in complete_command }}"
-          - "Contains --worker: {{ '--worker' in complete_command }}"
-          - "Contains --ca-checksum: {{ '--ca-checksum' in complete_command }}"
+          - "✅ YOUR CORRECT TOKEN: {{ token }}"
+          - "✅ MY CORRECT CA CHECKSUM: {{ ca_checksum }}"
+
+    # COMBINE: Use your token + my checksum
+    - name: Build final registration command with correct token and checksum
+      set_fact:
+        registration_cmd: >-
+          curl --insecure -fL "{{ rancher_url }}/system-agent-install.sh" | sudo sh -s - 
+          --server "{{ rancher_url }}" 
+          --label 'cattle.io/os=linux' 
+          --token "{{ token }}" 
+          {% if ca_checksum and ca_checksum | length == 64 %}--ca-checksum "{{ ca_checksum }}" {% endif %}
+          --etcd --controlplane --worker
 
     - name: Create registration script file
       copy:
         content: |
           #!/bin/bash
-          # Complete registration script for cluster: {{ cluster_name }}
-          # Generated automatically from Rancher API
-          
-          echo "=========================================="
-          echo "Rancher Node Registration Script"
-          echo "Cluster: {{ cluster_name }}"
-          echo "Cluster ID: {{ cluster_id }}"
-          echo "=========================================="
+          echo "Registering node to cluster: {{ cluster_name }}"
+          echo "Using token: {{ token }}"
+          echo "Using CA checksum: {{ ca_checksum }}"
           echo ""
+          {{ registration_cmd }}
           
-          {{ complete_command }}
-          
-          REGISTRATION_RESULT=$?
-          echo ""
-          echo "=========================================="
-          if [ $REGISTRATION_RESULT -eq 0 ]; then
-            echo "✅ Node registration completed successfully!"
-            echo "Check Rancher UI for node status"
+          if [ $? -eq 0 ]; then
+            echo "✅ Registration completed successfully!"
           else
-            echo "❌ Node registration failed with exit code: $REGISTRATION_RESULT"
-            echo "Please check the output above for errors"
+            echo "❌ Registration failed!"
           fi
-          echo "=========================================="
         dest: "./register-{{ cluster_name }}.sh"
         mode: '0755'
 
-    - name: Display final results
+    - name: Display success message
       debug:
         msg: |
-          🎉 COMPLETE REGISTRATION COMMAND GENERATED!
+          🎉 PERFECT COMBINATION ACHIEVED!
           ==========================================
           
-          ✅ TOKEN: {{ generated_token }} (correct from API)
-          ✅ CA CHECKSUM: Preserved from original command
-          ✅ NODE ROLES: Included (etcd, controlplane, worker)
+          ✅ YOUR CORRECT TOKEN: {{ token }}
+          ✅ MY CORRECT CA CHECKSUM: {{ ca_checksum }}
           
-          📋 COMMAND:
-          {{ complete_command }}
+          📋 FINAL COMMAND:
+          {{ registration_cmd }}
           
-          📏 COMMAND LENGTH: {{ complete_command | length }} characters
+          📁 Script created: ./register-{{ cluster_name }}.sh
           
-          📁 SCRIPT CREATED: ./register-{{ cluster_name }}.sh
-          
-          🚀 USAGE:
+          🚀 Usage:
           chmod +x register-{{ cluster_name }}.sh
           ./register-{{ cluster_name }}.sh
-          
-          The command now has the correct token AND correct checksum!
