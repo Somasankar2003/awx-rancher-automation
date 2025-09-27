@@ -30,7 +30,7 @@
           - "Node Roles: {{ node_roles }}"
           - "Node Count: {{ node_count }}"
 
-    - name: Create Custom Cluster in Rancher
+    - name: Create Custom Cluster in Rancher (without machinePools)
       uri:
         url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters"
         method: POST
@@ -46,16 +46,7 @@
             namespace: fleet-default
           spec:
             kubernetesVersion: "{{ kubernetes_version }}"
-            # For custom clusters, machinePools are not used for provisioning
-            # but we can store the configuration for reference
-            rkeConfig:
-              machinePools:
-                - name: "custom-pool"
-                  quantity: "{{ node_count | int }}"
-                  roles: "{{ node_roles }}"
-                  displayName: "custom-node-pool"
-                  # Note: For custom clusters, machineConfigRef is not used
-                  # as nodes are manually registered
+            # NO machinePools for custom clusters - nodes are added manually
         validate_certs: false
         status_code: 201
       register: create_cluster_response
@@ -64,20 +55,20 @@
       debug:
         var: create_cluster_response.json
 
-    - name: Wait for cluster to be in provisioning state
+    - name: Wait for cluster to be created
       uri:
-        url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters/fleet-default/{{ create_cluster_response.json.id }}"
+        url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters/fleet-default/{{ cluster_name }}"
         method: GET
         headers:
           Authorization: "Bearer {{ api_token }}"
         validate_certs: false
         status_code: 200
       register: cluster_status
-      until: cluster_status.json.state == "provisioning"
-      retries: 10
-      delay: 5
+      until: cluster_status.json.status.clusterName is defined
+      retries: 12
+      delay: 10
 
-    - name: Get cluster registration token
+    - name: Create cluster registration token
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
         method: POST
@@ -86,12 +77,12 @@
           Content-Type: "application/json"
         body_format: json
         body:
-          clusterId: "{{ create_cluster_response.json.id }}"
+          clusterId: "{{ cluster_name }}"
         validate_certs: false
         status_code: 201
       register: registration_token
 
-    - name: Get node registration command
+    - name: Wait for token to be ready and get registration command
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens/{{ registration_token.json.id }}"
         method: GET
@@ -100,20 +91,43 @@
         validate_certs: false
         status_code: 200
       register: token_info
-      retries: 5
-      delay: 3
+      until: token_info.json.nodeCommand is defined
+      retries: 10
+      delay: 5
 
-    - name: Display node registration information
+    - name: Display cluster creation summary
       debug:
         msg:
-          - "Custom cluster '{{ cluster_name }}' created successfully!"
-          - "Cluster ID: {{ create_cluster_response.json.id }}"
-          - "Node Count: {{ node_count }}"
-          - "Node Roles: {{ node_roles }}"
-          - "Registration Command: {{ token_info.json.nodeCommand }}"
-          - "Manual Registration Required: Run the above command on each node"
+          - "✓ Custom cluster '{{ cluster_name }}' created successfully!"
+          - "Cluster ID: {{ cluster_status.json.id }}"
+          - "Current State: {{ cluster_status.json.state }}"
+          - ""
+          - "NODE REGISTRATION INSTRUCTIONS:"
+          - "================================"
           - "Number of nodes to register: {{ node_count }}"
+          - "Node roles required: {{ node_roles }}"
+          - ""
+          - "Registration Command:"
+          - "{{ token_info.json.nodeCommand }}"
+          - ""
+          - "Manual Steps Required:"
+          - "1. Provision {{ node_count }} nodes in your infrastructure"
+          - "2. Run the above command on each node"
+          - "3. Ensure nodes have the correct roles: {{ node_roles }}"
+          - "4. Wait for all nodes to register in Rancher UI"
 
-    - name: Generate separate registration commands for each role (if needed)
-      debug:
-        msg: "For role-based node registration, use the same command but ensure proper role configuration on each node"
+    - name: Save registration command to file (optional)
+      copy:
+        content: |
+          Cluster Name: {{ cluster_name }}
+          Node Count: {{ node_count }}
+          Node Roles: {{ node_roles }}
+          Registration Command:
+          {{ token_info.json.nodeCommand }}
+          
+          Instructions:
+          1. Run this command on each of the {{ node_count }} nodes
+          2. Ensure nodes have network connectivity to Rancher server
+          3. Monitor registration in Rancher UI
+        dest: "/tmp/{{ cluster_name }}-registration.txt"
+      delegate_to: localhost
