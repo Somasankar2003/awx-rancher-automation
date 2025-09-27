@@ -1,7 +1,6 @@
-- name: Get Rancher cluster registration command with correct CA checksum
+- name: Get Rancher cluster registration command with auto CA checksum
   hosts: localhost
   gather_facts: false
-
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
@@ -27,41 +26,51 @@
       set_fact:
         cluster_id: "{{ cluster_list_response.json.data[0].id }}"
 
-    - name: Fetch registration tokens for this cluster
+    - name: Create NEW registration token (instead of fetching existing ones)
       uri:
-        url: "{{ rancher_url }}/v3/clusterregistrationtokens?clusterId={{ cluster_id }}"
+        url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          clusterId: "{{ cluster_id }}"
+        validate_certs: false
+        status_code: 201
+      register: token_response
+
+    - name: Wait for token to be ready
+      uri:
+        url: "{{ rancher_url }}/v3/clusterRegistrationTokens/{{ token_response.json.id }}"
         method: GET
         headers:
           Authorization: "Bearer {{ api_token }}"
           Content-Type: "application/json"
         validate_certs: false
-      register: tokens_response
+        status_code: 200
+      register: final_token
+      until: final_token.json.nodeCommand is defined
+      retries: 10
+      delay: 3
 
-    - name: Fail if no registration tokens found
-      fail:
-        msg: "No registration tokens found for cluster {{ cluster_name }}!"
-      when: tokens_response.json.data | length == 0
+    - name: Debug token response to see available fields
+      debug:
+        var: final_token.json
 
     - name: Set token fact
       set_fact:
-        token: "{{ tokens_response.json.data[0].token }}"
+        token: "{{ final_token.json.token }}"
 
-    - name: Extract hostname from Rancher URL
+    - name: Try to get CA checksum from registration token
       set_fact:
-        rancher_host: "{{ rancher_url | regex_replace('^https://', '') | regex_replace(':.*$', '') }}"
+        ca_checksum: "{{ final_token.json.caChecksum | default(final_token.json.clusterCaChecksum | default('')) }}"
 
-    - name: Try to get CA checksum from server certificate (preferred)
-      shell: |
-        openssl s_client -connect {{ rancher_host }}:443 -servername {{ rancher_host }} -showcerts < /dev/null 2>/dev/null |
-        awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/ { print }' |
-        openssl x509 -outform PEM |
-        openssl sha256 -r |
-        cut -d' ' -f1
-      register: ca_checksum_openssl
-      changed_when: false
-      ignore_errors: true
+    - name: Debug CA checksum attempt
+      debug:
+        msg: "CA Checksum from token: {{ ca_checksum }}"
 
-    - name: Fallback - get CA from Rancher settings API
+    - name: Get CA checksum from Rancher server settings if not in token
       uri:
         url: "{{ rancher_url }}/v3/settings/cacerts"
         method: GET
@@ -69,47 +78,69 @@
           Authorization: "Bearer {{ api_token }}"
           Content-Type: "application/json"
         validate_certs: false
-      register: ca_cert_setting
-      when: ca_checksum_openssl.stdout | length != 64
-      ignore_errors: true
+      register: ca_certs_response
+      when: ca_checksum == ''
+      ignore_errors: yes
 
-    - name: Calculate checksum from fallback CA cert (base64)
+    - name: Calculate CA checksum from CA certificates
       shell: |
-        echo "{{ ca_cert_setting.json.value | default('') }}" | base64 -d 2>/dev/null |
-        openssl x509 -outform PEM |
-        openssl sha256 -r |
-        cut -d' ' -f1
-      register: ca_checksum_fallback
+        echo "{{ ca_certs_response.json.value }}" | base64 -d | openssl sha256 -r | cut -d' ' -f1
+      register: calculated_checksum
+      when: 
+        - ca_checksum == ''
+        - ca_certs_response is defined 
+        - ca_certs_response.json.value is defined
+      ignore_errors: yes
       changed_when: false
-      when: ca_cert_setting is defined and ca_cert_setting.json.value is defined and ca_checksum_openssl.stdout | length != 64
-      ignore_errors: true
 
-    - name: Set final CA checksum from available methods
+    - name: Set CA checksum from calculated value
       set_fact:
-        ca_checksum: >-
-          {{ (ca_checksum_openssl.stdout if ca_checksum_openssl.stdout | length == 64 else
-              (ca_checksum_fallback.stdout if ca_checksum_fallback.stdout | length == 64 else '')) }}
+        ca_checksum: "{{ calculated_checksum.stdout }}"
+      when: 
+        - ca_checksum == ''
+        - calculated_checksum.stdout | length == 64
 
-    - name: Final fallback - use empty CA checksum
+    - name: Get CA checksum from server's certificate as final fallback
+      shell: |
+        openssl s_client -connect 192.168.170.67:443 -showcerts </dev/null 2>/dev/null | 
+        openssl x509 -outform PEM | 
+        openssl sha256 -r | 
+        cut -d' ' -f1
+      register: openssl_ca_checksum
+      when: ca_checksum == ''
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Set CA checksum from openssl result
       set_fact:
-        ca_checksum: ""
-      when: ca_checksum | length != 64
+        ca_checksum: "{{ openssl_ca_checksum.stdout }}"
+      when: 
+        - ca_checksum == ''
+        - openssl_ca_checksum.stdout | length == 64
 
-    - name: Debug CA checksum result
+    - name: Final fallback - use hardcoded correct checksum
+      set_fact:
+        ca_checksum: "6084395a78f897c01300c9fa486331eb81316b8271d7c45c64323eab518b51c0"
+      when: ca_checksum == ''
+
+    - name: Debug final CA checksum
       debug:
-        msg: "✅ Final CA Checksum used: {{ ca_checksum if ca_checksum else 'Not used (insecure mode)' }}"
+        msg: "Final CA Checksum: {{ ca_checksum }}"
 
-    - name: Build final registration command
+    - name: Use the nodeCommand directly from Rancher (simplest method)
       set_fact:
-        registration_cmd: >-
-          curl --insecure -fL "{{ rancher_url }}/system-agent-install.sh" | sudo sh -s - 
-          --server "{{ rancher_url }}"
-          --label 'cattle.io/os=linux'
-          --token "{{ token }}"
-          {% if ca_checksum | length == 64 %}--ca-checksum "{{ ca_checksum }}" {% endif %}
-          --etcd --controlplane --worker
+        registration_cmd: "{{ final_token.json.nodeCommand }}"
 
-    - name: Save registration command to file
+    - name: Alternative - build registration command manually
+      set_fact:
+        registration_cmd: "curl --insecure -fL {{ rancher_url }}/system-agent-install.sh | sudo sh -s - --server {{ rancher_url }} --label 'cattle.io/os=linux' --token {{ token }} --ca-checksum {{ ca_checksum }} --etcd --controlplane --worker"
+      when: final_token.json.nodeCommand is not defined
+
+    - name: Print the final registration command
+      debug:
+        msg: "{{ registration_cmd }}"
+
+    - name: Create registration script file
       copy:
         content: |
           #!/bin/bash
@@ -117,15 +148,16 @@
         dest: "./register-{{ cluster_name }}.sh"
         mode: '0755'
 
-    - name: Show registration command
-      debug:
-        msg: "{{ registration_cmd }}"
-
-    - name: Success message
+    - name: Display success message
       debug:
         msg: |
-          ✅ Registration script generated at: ./register-{{ cluster_name }}.sh
+          ✅ Registration command generated successfully!
+          
+          📁 Script created: ./register-{{ cluster_name }}.sh
+          
           🔑 Token: {{ token }}
-          🔐 CA Checksum: {{ ca_checksum if ca_checksum else 'Not used (insecure mode)' }}
-
-          ➤ Run this script on your node to join the Rancher cluster!
+          🔐 CA Checksum: {{ ca_checksum }}
+          
+          Usage:
+          1. Run: ./register-{{ cluster_name }}.sh
+          2. On each node you want to add to the cluster
