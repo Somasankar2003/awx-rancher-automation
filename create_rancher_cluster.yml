@@ -1,28 +1,24 @@
----
-- name: Create Custom Provider Cluster in Rancher
+- name: Create Rancher Custom Provider Cluster
   hosts: localhost
   gather_facts: no
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "openstack-cluster"
-
   tasks:
-    - name: Create cluster payload
+    - name: Prepare cluster payload
       set_fact:
         cluster_payload:
           type: cluster
           name: "{{ cluster_name }}"
           customClusterConfig:
             rancherKubernetesEngineConfig:
-              # You can define more config here as needed
               machinePools:
                 - name: "{{ pool_name }}"
                   nodeCount: "{{ node_count | int }}"
                   roles: "{{ node_roles.split(',') }}"
-                  # Other fields like 'machineConfig' or 'labels' can be added if needed
-
-    - name: Create Rancher cluster
+                  
+    - name: Create cluster in Rancher
       uri:
         url: "{{ rancher_url }}/v3/clusters"
         method: POST
@@ -32,8 +28,8 @@
         body: "{{ cluster_payload | to_json }}"
         status_code: 201
         return_content: yes
-      register: rancher_cluster_response
+      register: result
 
-    - name: Show Rancher cluster creation response
+    - name: Show result
       debug:
-        var: rancher_cluster_response.json
+        var: result.json
