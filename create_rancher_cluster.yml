@@ -1,5 +1,4 @@
----
-- name: Create Rancher Custom Cluster via API (Provisioning v1)
+- name: Create Rancher Custom Cluster via API (Provisioning v1) with AWX Survey
   hosts: localhost
   gather_facts: false
 
@@ -9,20 +8,29 @@
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
 
     # Cluster Details
-    cluster_name: "openstack-cluster"
-    kubernetes_version: "v1.33.4+rke2r1"
-    pool_name: "default-pool"          # <-- Now defined here
-    # node_roles and node_count should still come from AWX or CLI extra-vars
+    cluster_name: "custom-cluster"
+    kubernetes_version: "v1.33.1+rke2r1"
 
   tasks:
-    - name: Validate node_roles is a list
+    - name: Validate survey variables
       assert:
         that:
+          - node_roles is defined
+          - node_count is defined
           - node_roles is iterable
-        fail_msg: "node_roles must be a list (set as Multiple Choice in AWX survey)"
-        success_msg: "node_roles is a valid list."
+          - node_count | int > 0
+        fail_msg: "Please provide valid node_roles (list) and node_count (positive integer) via AWX survey"
+        success_msg: "Survey variables validated successfully"
 
-    - name: Create OpenStack cluster in Rancher (Custom Cluster)
+    - name: Display survey inputs
+      debug:
+        msg:
+          - "Cluster Name: {{ cluster_name }}"
+          - "Kubernetes Version: {{ kubernetes_version }}"
+          - "Node Roles: {{ node_roles }}"
+          - "Node Count: {{ node_count }}"
+
+    - name: Create Custom Cluster in Rancher
       uri:
         url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters"
         method: POST
@@ -38,21 +46,16 @@
             namespace: fleet-default
           spec:
             kubernetesVersion: "{{ kubernetes_version }}"
+            # For custom clusters, machinePools are not used for provisioning
+            # but we can store the configuration for reference
             rkeConfig:
               machinePools:
-                - name: "{{ pool_name }}"
+                - name: "custom-pool"
                   quantity: "{{ node_count | int }}"
                   roles: "{{ node_roles }}"
-                  displayName: "{{ pool_name }}"
-                  hostnamePrefix: "{{ cluster_name }}-node"
-                  machineConfigRef:
-                    kind: MachineConfig
-                    name: "{{ pool_name }}"
-              chartValues:
-                rke2-coredns: {}
-                rke2-ingress-nginx: {}
-                rke2-kube-proxy: {}
-                rke2-metrics-server: {}
+                  displayName: "custom-node-pool"
+                  # Note: For custom clusters, machineConfigRef is not used
+                  # as nodes are manually registered
         validate_certs: false
         status_code: 201
       register: create_cluster_response
@@ -60,3 +63,57 @@
     - name: Show Rancher API response
       debug:
         var: create_cluster_response.json
+
+    - name: Wait for cluster to be in provisioning state
+      uri:
+        url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters/fleet-default/{{ create_cluster_response.json.id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+        validate_certs: false
+        status_code: 200
+      register: cluster_status
+      until: cluster_status.json.state == "provisioning"
+      retries: 10
+      delay: 5
+
+    - name: Get cluster registration token
+      uri:
+        url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          clusterId: "{{ create_cluster_response.json.id }}"
+        validate_certs: false
+        status_code: 201
+      register: registration_token
+
+    - name: Get node registration command
+      uri:
+        url: "{{ rancher_url }}/v3/clusterRegistrationTokens/{{ registration_token.json.id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+        validate_certs: false
+        status_code: 200
+      register: token_info
+      retries: 5
+      delay: 3
+
+    - name: Display node registration information
+      debug:
+        msg:
+          - "Custom cluster '{{ cluster_name }}' created successfully!"
+          - "Cluster ID: {{ create_cluster_response.json.id }}"
+          - "Node Count: {{ node_count }}"
+          - "Node Roles: {{ node_roles }}"
+          - "Registration Command: {{ token_info.json.nodeCommand }}"
+          - "Manual Registration Required: Run the above command on each node"
+          - "Number of nodes to register: {{ node_count }}"
+
+    - name: Generate separate registration commands for each role (if needed)
+      debug:
+        msg: "For role-based node registration, use the same command but ensure proper role configuration on each node"
