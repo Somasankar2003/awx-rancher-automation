@@ -47,14 +47,16 @@
             namespace: fleet-default
           spec:
             kubernetesVersion: "{{ kubernetes_version }}"
-            rkeConfig: 
-              machinePools: []
-            # Explicitly set to empty driver for custom cluster
+            rkeConfig: {}
         validate_certs: false
         status_code: 201
       register: create_cluster_response
 
-    - name: Wait for cluster to be ready
+    - name: Debug cluster creation response
+      debug:
+        var: create_cluster_response.json
+
+    - name: Wait for cluster to be created (check if it exists)
       uri:
         url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters/fleet-default/{{ cluster_name }}"
         method: GET
@@ -63,11 +65,36 @@
         validate_certs: false
         status_code: 200
       register: cluster_status
-      until: cluster_status.json.state == "provisioning"
+      until: cluster_status.status == 200
       retries: 30
       delay: 5
 
-    - name: Get cluster registration token for CUSTOM workflow
+    - name: Debug cluster status response
+      debug:
+        var: cluster_status.json
+
+    - name: Get cluster ID from v3 API
+      uri:
+        url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+        validate_certs: false
+        status_code: 200
+      register: v3_cluster_info
+
+    - name: Debug v3 cluster info
+      debug:
+        var: v3_cluster_info.json
+
+    - name: Extract cluster ID
+      set_fact:
+        cluster_id: "{{ v3_cluster_info.json.data[0].id }}"
+      when: 
+        - v3_cluster_info.json.data is defined
+        - v3_cluster_info.json.data | length > 0
+
+    - name: Create cluster registration token
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
         method: POST
@@ -76,7 +103,7 @@
           Content-Type: "application/json"
         body_format: json
         body:
-          clusterId: "{{ cluster_name }}"
+          clusterId: "{{ cluster_id | default(cluster_name) }}"
         validate_certs: false
         status_code: 201
       register: token_response
@@ -99,76 +126,33 @@
         msg:
           - "✅ CUSTOM CLUSTER FRAMEWORK CREATED SUCCESSFULLY!"
           - "Cluster Name: {{ cluster_name }}"
+          - "Cluster ID: {{ cluster_id | default('Unknown') }}"
           - "Cluster Type: Manual Kubernetes Installation Required"
           - ""
-          - "🚨 MANUAL KUBERNETES INSTALLATION REQUIRED:"
-          - "==========================================="
-          - "This is a TRUE custom cluster. You must manually install Kubernetes."
-          - ""
-          - "Step 1: INSTALL KUBERNETES on {{ node_count }} nodes:"
-          - "----------------------------------------------------"
-          - "Choose ONE of these methods:"
-          - ""
-          - "OPTION A: Install RKE2 manually:"
-          - "  curl -sfL https://get.rke2.io | INSTALL_RKE2_VERSION='{{ kubernetes_version }}' sh -"
-          - "  # Configure roles in /etc/rancher/rke2/config.yaml"
-          - ""
-          - "OPTION B: Install K3s manually:"
-          - "  curl -sfL https://get.k3s.io | sh -"
-          - ""
-          - "Step 2: CONFIGURE NODE ROLES:"
-          - "---------------------------"
-          - "Ensure nodes have these roles: {{ actual_node_roles }}"
-          - "- etcd: Store cluster data"
-          - "- controlplane: Kubernetes API server"
-          - "- worker: Run workloads"
-          - ""
-          - "Step 3: REGISTER NODES WITH RANCHER:"
-          - "-----------------------------------"
-          - "Run this command on EACH node AFTER Kubernetes is installed:"
+          - "📋 REGISTRATION COMMAND:"
           - "{{ final_token.json.nodeCommand }}"
           - ""
-          - "Step 4: WAIT FOR REGISTRATION:"
-          - "----------------------------"
-          - "Monitor in Rancher UI until all {{ node_count }} nodes appear"
+          - "🔧 MANUAL STEPS REQUIRED:"
+          - "1. Install Kubernetes (RKE2/K3s) manually on {{ node_count }} nodes"
+          - "2. Configure nodes with roles: {{ actual_node_roles }}"
+          - "3. Run the registration command on each node"
+          - "4. Wait for nodes to appear in Rancher UI"
 
-    - name: Save MANUAL installation instructions
+    - name: Save registration info
       copy:
         content: |
-          TRUE CUSTOM CLUSTER - MANUAL INSTALLATION
-          ========================================
+          Custom Cluster Registration
+          ===========================
+          Cluster: {{ cluster_name }}
+          Nodes: {{ node_count }}
+          Roles: {{ actual_node_roles }}
           
-          Cluster Name: {{ cluster_name }}
-          Kubernetes Version: {{ kubernetes_version }}
-          Node Count: {{ node_count }}
-          Node Roles: {{ actual_node_roles }}
-          
-          IMPORTANT: This cluster requires MANUAL Kubernetes installation.
-          
-          STEP 1: INSTALL KUBERNETES ON NODES
-          -----------------------------------
-          Install RKE2 or K3s manually on each node:
-          
-          For RKE2:
-          curl -sfL https://get.rke2.io | INSTALL_RKE2_VERSION='{{ kubernetes_version }}' sh -
-          
-          For K3s:
-          curl -sfL https://get.k3s.io | sh -
-          
-          STEP 2: CONFIGURE NODE ROLES
-          ----------------------------
-          Configure each node with appropriate roles in Kubernetes configuration.
-          
-          STEP 3: REGISTER WITH RANCHER
-          -----------------------------
-          Run this command on each node AFTER Kubernetes is running:
-          
+          Registration Command:
           {{ final_token.json.nodeCommand }}
           
-          STEP 4: VERIFY
-          --------------
-          Check Rancher UI to see all {{ node_count }} nodes registered.
-          
-          Expected node roles: {{ actual_node_roles }}
-        dest: "/tmp/{{ cluster_name }}-manual-installation.txt"
+          Instructions:
+          1. Manually install Kubernetes on nodes
+          2. Run the command above on each node
+          3. Configure appropriate roles
+        dest: "/tmp/{{ cluster_name }}-registration.txt"
       delegate_to: localhost
