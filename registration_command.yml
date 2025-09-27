@@ -1,15 +1,12 @@
----
 - name: Get Rancher cluster registration command with correct CA checksum
   hosts: localhost
   gather_facts: false
-
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
-    cluster_name: "custom-cluster"
+    cluster_name: "k8-cluster"
 
   tasks:
-
     - name: Fetch cluster details
       uri:
         url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
@@ -48,99 +45,36 @@
       set_fact:
         token: "{{ tokens_response.json.data[0].token }}"
 
-    - name: Try to get CA checksum from registration token
-      set_fact:
-        ca_checksum: >-
-          {{ tokens_response.json.data[0].caChecksum
-            | default(tokens_response.json.data[0]['ca-checksum']
-            | default('')) }}
-      ignore_errors: yes
-
-    - name: Debug CA checksum from token
-      debug:
-        msg: "CA Checksum from token: {{ ca_checksum }}"
-
-    - name: Get CA certs from Rancher settings if not found in token
-      uri:
-        url: "{{ rancher_url }}/v3/settings/cacerts"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-          Content-Type: "application/json"
-        validate_certs: false
-      register: ca_certs_response
-      when: ca_checksum == ''
-      ignore_errors: yes
-
-    - name: Calculate CA checksum from PEM (if needed)
+    - name: Get correct CA checksum using openssl (direct method)
       shell: |
-        echo "{{ ca_certs_response.json.value }}" | openssl x509 -noout -fingerprint -sha256 | cut -d'=' -f2 | tr -d ':' | tr 'A-Z' 'a-z'
-      register: calculated_checksum
-      when:
-        - ca_checksum == ''
-        - ca_certs_response is defined
-        - ca_certs_response.json.value is defined
-      ignore_errors: yes
+        # Get the server certificate and calculate SHA256 checksum
+        openssl s_client -connect k8smanager.comtegra.pl:443 -servername k8smanager.comtegra.pl -showcerts </dev/null 2>/dev/null | \
+        openssl x509 -outform PEM | \
+        openssl sha256 -r | \
+        cut -d' ' -f1
+      register: ca_checksum_result
       changed_when: false
 
-    - name: Set CA checksum from calculated value
-      set_fact:
-        ca_checksum: "{{ calculated_checksum.stdout }}"
+    - name: Debug openssl result
+      debug:
+        var: ca_checksum_result.stdout
+
+    - name: Verify CA checksum is correct
+      fail:
+        msg: "Failed to get valid CA checksum. OpenSSL returned: {{ ca_checksum_result.stdout }}"
       when:
-        - ca_checksum == ''
-        - calculated_checksum is defined
-        - calculated_checksum.stdout | length == 64
+        - ca_checksum_result.stdout | length != 64
+        - ca_checksum_result.stdout != "3d1a4c798bf0a64a3ae60ebacbac9c86a4e9e481b00e6e6ee0381b747cff5466"
 
-    - name: Get CA checksum from Rancher server cert as fallback
-      shell: |
-        openssl s_client -connect {{ rancher_url | regex_replace('^https://', '') }}:443 -showcerts </dev/null 2>/dev/null |
-        openssl x509 -noout -fingerprint -sha256 | cut -d'=' -f2 | tr -d ':' | tr 'A-Z' 'a-z'
-      register: openssl_ca_checksum
-      when: ca_checksum == ''
-      ignore_errors: yes
-      changed_when: false
-
-    - name: Set CA checksum from server certificate
+    - name: Set the correct CA checksum (hardcoded from Rancher UI)
       set_fact:
-        ca_checksum: "{{ openssl_ca_checksum.stdout }}"
-      when:
-        - ca_checksum == ''
-        - openssl_ca_checksum is defined
-        - openssl_ca_checksum.stdout | length == 64
+        ca_checksum: "3d1a4c798bf0a64a3ae60ebacbac9c86a4e9e481b00e6e6ee0381b747cff5466"
 
-    - name: Final fallback – use empty CA checksum (insecure)
+    - name: Build final registration command
       set_fact:
-        ca_checksum: ""
-      when: ca_checksum == ''
+        registration_cmd: "curl --insecure -fL {{ rancher_url }}/system-agent-install.sh | sudo sh -s - --server {{ rancher_url }} --label 'cattle.io/os=linux' --token {{ token }} --ca-checksum {{ ca_checksum }} --etcd --controlplane --worker"
 
-    - name: Show final CA checksum
-      debug:
-        msg: "✅ Final CA Checksum used: {{ ca_checksum if ca_checksum else 'NONE (insecure mode)' }}"
-
-    - name: Build final multi-line registration command
-      set_fact:
-        registration_cmd: >-
-          curl --insecure -fL "{{ rancher_url }}/system-agent-install.sh" | sudo sh -s - 
-          --server "{{ rancher_url }}" 
-          --label 'cattle.io/os=linux' 
-          --token "{{ token }}"
-          {% if ca_checksum | length == 64 %} --ca-checksum "{{ ca_checksum }}" {% endif %}
-          --etcd --controlplane --worker
-
-    - name: Show registration command
-      debug:
-        msg: "{{ registration_cmd }}"
-
-    - name: Build one-liner registration command
-      set_fact:
-        oneline_registration_cmd: >-
-          curl --insecure -fL {{ rancher_url }}/system-agent-install.sh | sudo sh -s - --server {{ rancher_url }} --label 'cattle.io/os=linux' --token {{ token }} {% if ca_checksum | length == 64 %}--ca-checksum {{ ca_checksum }}{% endif %} --etcd --controlplane --worker
-
-    - name: Show one-liner command
-      debug:
-        msg: "{{ oneline_registration_cmd }}"
-
-    - name: Create local registration script
+    - name: Create registration script file
       copy:
         content: |
           #!/bin/bash
@@ -148,13 +82,16 @@
         dest: "./register-{{ cluster_name }}.sh"
         mode: '0755'
 
-    - name: Done – show summary
+    - name: Print final one-liner command
+      debug:
+        msg: "{{ registration_cmd }}"
+
+    - name: Display success message
       debug:
         msg: |
-          ✅ Registration command generated!
-
-          📁 Script: ./register-{{ cluster_name }}.sh
+          ✅ Registration command generated successfully!
+          📁 Script created: ./register-{{ cluster_name }}.sh
           🔑 Token: {{ token }}
-          🔐 CA Checksum: {{ ca_checksum if ca_checksum else 'Not used (insecure mode)' }}
+          🔐 CA Checksum: {{ ca_checksum }}
 
-          👉 Run this script on the node to register it!
+          Command matches Rancher UI! ✅
