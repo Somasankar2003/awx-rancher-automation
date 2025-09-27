@@ -4,7 +4,7 @@
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
-    cluster_name: "k8-cluster"
+    cluster_name: "custom-cluster"
 
   tasks:
     - name: Fetch cluster details
