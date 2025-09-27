@@ -1,10 +1,11 @@
 - name: Get Rancher cluster registration command with correct CA checksum
   hosts: localhost
   gather_facts: false
+
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
-    cluster_name: "k8-cluster"
+    cluster_name: "custom-cluster"
 
   tasks:
     - name: Fetch cluster details
@@ -45,66 +46,70 @@
       set_fact:
         token: "{{ tokens_response.json.data[0].token }}"
 
-    - name: Get CA checksum from Rancher server certificate (correct method)
-      shell: |
-        # Extract hostname from URL and get certificate directly
-        echo "{{ rancher_url }}" | sed 's|https://||' | sed 's|:[0-9]*||'
-      register: rancher_hostname
-      changed_when: false
-
-    - name: Debug rancher hostname
-      debug:
-        var: rancher_hostname.stdout
-
-    - name: Get CA certificate and calculate correct SHA256 checksum
-      shell: |
-        # Get the leaf certificate and follow the chain to get the root CA
-        openssl s_client -connect {{ rancher_hostname.stdout }}:443 -servername {{ rancher_hostname.stdout }} -showcerts < /dev/null 2>/dev/null | \
-        awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/ {print}' | \
-        openssl x509 -outform PEM | \
-        openssl sha256 -r | \
-        cut -d' ' -f1
-      register: ca_checksum_result
-      changed_when: false
-
-    - name: Alternative method - get CA checksum from Rancher's CA endpoint
-      shell: |
-        # Try to get the CA certificate directly from Rancher
-        curl -sk {{ rancher_url }}/v3/settings/cacerts 2>/dev/null | \
-        python3 -c "import json, sys; data=json.load(sys.stdin); print(data.get('value', ''))" | \
-        base64 -d 2>/dev/null | \
-        openssl x509 -outform PEM | \
-        openssl sha256 -r | \
-        cut -d' ' -f1
-      register: ca_checksum_alternative
-      changed_when: false
-      ignore_errors: yes
-
-    - name: Debug both CA checksum results
-      debug:
-        msg:
-          - "Method 1 (SSL certificate): {{ ca_checksum_result.stdout }}"
-          - "Method 2 (Rancher API): {{ ca_checksum_alternative.stdout }}"
-
-    - name: Determine which CA checksum to use
+    - name: Extract hostname from Rancher URL
       set_fact:
-        ca_checksum: "{{ ca_checksum_alternative.stdout if ca_checksum_alternative.stdout | length == 64 else ca_checksum_result.stdout }}"
+        rancher_host: "{{ rancher_url | regex_replace('^https://', '') | regex_replace(':.*$', '') }}"
 
-    - name: Final fallback - use known correct checksum
+    - name: Try to get CA checksum from server certificate (preferred)
+      shell: |
+        openssl s_client -connect {{ rancher_host }}:443 -servername {{ rancher_host }} -showcerts < /dev/null 2>/dev/null |
+        awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/ { print }' |
+        openssl x509 -outform PEM |
+        openssl sha256 -r |
+        cut -d' ' -f1
+      register: ca_checksum_openssl
+      changed_when: false
+      ignore_errors: true
+
+    - name: Fallback - get CA from Rancher settings API
+      uri:
+        url: "{{ rancher_url }}/v3/settings/cacerts"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+          Content-Type: "application/json"
+        validate_certs: false
+      register: ca_cert_setting
+      when: ca_checksum_openssl.stdout | length != 64
+      ignore_errors: true
+
+    - name: Calculate checksum from fallback CA cert (base64)
+      shell: |
+        echo "{{ ca_cert_setting.json.value | default('') }}" | base64 -d 2>/dev/null |
+        openssl x509 -outform PEM |
+        openssl sha256 -r |
+        cut -d' ' -f1
+      register: ca_checksum_fallback
+      changed_when: false
+      when: ca_cert_setting is defined and ca_cert_setting.json.value is defined and ca_checksum_openssl.stdout | length != 64
+      ignore_errors: true
+
+    - name: Set final CA checksum from available methods
       set_fact:
-        ca_checksum: "6084395a78f897c01300c9fa486331eb81316b8271d7c45c64323eab518b51c0"
+        ca_checksum: >-
+          {{ (ca_checksum_openssl.stdout if ca_checksum_openssl.stdout | length == 64 else
+              (ca_checksum_fallback.stdout if ca_checksum_fallback.stdout | length == 64 else '')) }}
+
+    - name: Final fallback - use empty CA checksum
+      set_fact:
+        ca_checksum: ""
       when: ca_checksum | length != 64
 
-    - name: Verify CA checksum is correct
-      fail:
-        msg: "Failed to get valid CA checksum. Got: {{ ca_checksum }}"
-      when: ca_checksum | length != 64
+    - name: Debug CA checksum result
+      debug:
+        msg: "✅ Final CA Checksum used: {{ ca_checksum if ca_checksum else 'Not used (insecure mode)' }}"
 
-    - name: Build final registration command with correct CA checksum
+    - name: Build final registration command
       set_fact:
-        registration_cmd: "curl --insecure -fL {{ rancher_url }}/system-agent-install.sh | sudo sh -s - --server {{ rancher_url }} --label 'cattle.io/os=linux' --token {{ token }} --ca-checksum {{ ca_checksum }} --etcd --controlplane --worker"
+        registration_cmd: >-
+          curl --insecure -fL "{{ rancher_url }}/system-agent-install.sh" | sudo sh -s - 
+          --server "{{ rancher_url }}"
+          --label 'cattle.io/os=linux'
+          --token "{{ token }}"
+          {% if ca_checksum | length == 64 %}--ca-checksum "{{ ca_checksum }}" {% endif %}
+          --etcd --controlplane --worker
 
-    - name: Create registration script file
+    - name: Save registration command to file
       copy:
         content: |
           #!/bin/bash
@@ -112,17 +117,15 @@
         dest: "./register-{{ cluster_name }}.sh"
         mode: '0755'
 
-    - name: Print final one-liner command
+    - name: Show registration command
       debug:
         msg: "{{ registration_cmd }}"
 
-    - name: Display success message
+    - name: Success message
       debug:
         msg: |
-          ✅ Registration command generated successfully!
-          📁 Script created: ./register-{{ cluster_name }}.sh
+          ✅ Registration script generated at: ./register-{{ cluster_name }}.sh
           🔑 Token: {{ token }}
-          🔐 CA Checksum: {{ ca_checksum }}
-          🔍 Calculated automatically from Rancher server
+          🔐 CA Checksum: {{ ca_checksum if ca_checksum else 'Not used (insecure mode)' }}
 
-          Command should match Rancher UI! ✅
+          ➤ Run this script on your node to join the Rancher cluster!
