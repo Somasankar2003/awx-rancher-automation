@@ -32,7 +32,7 @@
             name: "{{ cluster_name }}"
             namespace: fleet-default
           spec:
-            kubernetesVersion: "v1.33.1+rke2r1"
+            kubernetesVersion: "v1.33.4+rke2r1"
             rkeConfig:
               machinePools:
                 - name: "{{ pool_name }}"
