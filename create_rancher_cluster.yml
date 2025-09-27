@@ -1,47 +1,39 @@
 ---
-- name: Create Rancher Custom Cluster via API
+- name: Create Custom Provider Cluster in Rancher
   hosts: localhost
-  gather_facts: false
+  gather_facts: no
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "openstack-cluster"
 
   tasks:
-    - name: Ensure node_roles is a list (in case survey sends string)
+    - name: Create cluster payload
       set_fact:
-        node_roles_list: >-
-          {{
-            (node_roles if node_roles is defined and node_roles is sequence else
-            (node_roles|string if node_roles is defined else 'worker') .split(','))
-            | map('trim')
-            | list
-          }}
+        cluster_payload:
+          type: cluster
+          name: "{{ cluster_name }}"
+          customClusterConfig:
+            rancherKubernetesEngineConfig:
+              # You can define more config here as needed
+              machinePools:
+                - name: "{{ pool_name }}"
+                  nodeCount: "{{ node_count | int }}"
+                  roles: "{{ node_roles.split(',') }}"
+                  # Other fields like 'machineConfig' or 'labels' can be added if needed
 
-    - name: Create OpenStack cluster in Rancher (Custom Cluster)
+    - name: Create Rancher cluster
       uri:
-        url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters"
+        url: "{{ rancher_url }}/v3/clusters"
         method: POST
         headers:
           Authorization: "Bearer {{ api_token }}"
           Content-Type: "application/json"
-        body_format: json
-        body:
-          apiVersion: provisioning.cattle.io/v1
-          kind: Cluster
-          metadata:
-            name: "{{ cluster_name }}"
-          spec:
-            kubernetesVersion: "v1.26.3+rke2r1"
-            rkeConfig:
-              machinePools:
-                - name: "{{ pool_name }}"
-                  quantity: "{{ node_count | int }}"
-                  roles: "{{ node_roles_list }}"
-        validate_certs: false
+        body: "{{ cluster_payload | to_json }}"
         status_code: 201
-      register: create_cluster_response
+        return_content: yes
+      register: rancher_cluster_response
 
-    - name: Show Rancher API response
+    - name: Show Rancher cluster creation response
       debug:
-        var: create_cluster_response.json
+        var: rancher_cluster_response.json
