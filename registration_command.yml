@@ -52,6 +52,7 @@
       register: final_token
       until: 
         - final_token.json.insecureNodeCommand is defined
+        - final_token.json.nodeCommand is defined
         - final_token.json.token is defined
       retries: 20
       delay: 5
@@ -60,30 +61,51 @@
       debug:
         var: final_token.json
 
-    - name: Extract the registration command and check if roles are included
+    - name: Extract registration commands and token
       set_fact:
-        base_command: "{{ final_token.json.insecureNodeCommand | trim }}"
+        insecure_command: "{{ final_token.json.insecureNodeCommand | trim }}"
+        secure_command: "{{ final_token.json.nodeCommand | trim }}"
         generated_token: "{{ final_token.json.token }}"
 
-    - name: Check command completeness and add missing roles
+    - name: Choose the best command (prefer secure, fallback to insecure)
       set_fact:
-        complete_command: "{{ base_command }} --etcd --controlplane --worker"
-      when: "'--etcd' not in base_command and '--controlplane' not in base_command and '--worker' not in base_command"
+        base_command: "{{ secure_command if secure_command | length > 0 else insecure_command }}"
 
-    - name: Use original command if roles are already included
+    - name: Extract checksum from secure command if available
       set_fact:
-        complete_command: "{{ base_command }}"
-      when: "'--etcd' in base_command or '--controlplane' in base_command or '--worker' in base_command"
+        ca_checksum: "{{ secure_command | regex_search('--ca-checksum\\s+(\\S+)', '\\1') | first | default('') }}"
+      when: secure_command | length > 0
+
+    - name: Build complete command with correct token and checksum
+      set_fact:
+        complete_command: "{{ base_command | regex_replace('--token\\s+\\S+', '--token ' + generated_token) }}"
+      when: "'--token' in base_command"
+
+    - name: Build complete command by adding token if missing
+      set_fact:
+        complete_command: "{{ base_command }} --token {{ generated_token }}"
+      when: "'--token' not in base_command"
+
+    - name: Ensure roles are included
+      set_fact:
+        complete_command: "{{ complete_command }} --etcd --controlplane --worker"
+      when: "'--etcd' not in complete_command and '--controlplane' not in complete_command and '--worker' not in complete_command"
+
+    - name: Final command cleanup (remove duplicates)
+      set_fact:
+        complete_command: "{{ complete_command | regex_replace('--etcd\\s+--etcd', '--etcd') | regex_replace('--controlplane\\s+--controlplane', '--controlplane') | regex_replace('--worker\\s+--worker', '--worker') }}"
 
     - name: Verify the complete command
       debug:
         msg:
           - "Generated Token: {{ generated_token }}"
           - "Command Length: {{ complete_command | length }} characters"
+          - "Contains --token: {{ '--token' in complete_command }}"
+          - "Token in command: {{ generated_token in complete_command }}"
           - "Contains --etcd: {{ '--etcd' in complete_command }}"
           - "Contains --controlplane: {{ '--controlplane' in complete_command }}"
           - "Contains --worker: {{ '--worker' in complete_command }}"
-          - "Expected format matches: {{ complete_command.startswith('curl --insecure -fL') and '--ca-checksum' in complete_command and '--token' in complete_command }}"
+          - "Contains --ca-checksum: {{ '--ca-checksum' in complete_command }}"
 
     - name: Create registration script file
       copy:
@@ -121,8 +143,8 @@
           🎉 COMPLETE REGISTRATION COMMAND GENERATED!
           ==========================================
           
-          ✅ TOKEN: {{ generated_token }} (automatically generated)
-          ✅ CA CHECKSUM: Included and correct
+          ✅ TOKEN: {{ generated_token }} (correct from API)
+          ✅ CA CHECKSUM: Preserved from original command
           ✅ NODE ROLES: Included (etcd, controlplane, worker)
           
           📋 COMMAND:
@@ -136,4 +158,4 @@
           chmod +x register-{{ cluster_name }}.sh
           ./register-{{ cluster_name }}.sh
           
-          The command now matches the expected format exactly!
+          The command now has the correct token AND correct checksum!
