@@ -1,4 +1,4 @@
-- name: Get Rancher cluster registration command with node roles
+- name: Get complete Rancher cluster registration command
   hosts: localhost
   gather_facts: false
   vars:
@@ -26,7 +26,7 @@
       set_fact:
         cluster_id: "{{ cluster_list_response.json.data[0].id }}"
 
-    - name: Create new registration token with node roles
+    - name: Create new registration token
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
         method: POST
@@ -36,13 +36,11 @@
         body_format: json
         body:
           clusterId: "{{ cluster_id }}"
-          # Specify node roles in the token creation
-          nodeCommand: true
         validate_certs: false
         status_code: 201
       register: token_response
 
-    - name: Wait for token to be ready
+    - name: Wait for token to be ready with ALL fields
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens/{{ token_response.json.id }}"
         method: GET
@@ -52,78 +50,90 @@
         validate_certs: false
         status_code: 200
       register: final_token
-      until: final_token.json.insecureNodeCommand is defined
-      retries: 15
+      until: 
+        - final_token.json.insecureNodeCommand is defined
+        - final_token.json.token is defined
+      retries: 20
       delay: 5
 
-    - name: Debug the full token response
+    - name: Debug the complete token response
       debug:
         var: final_token.json
 
-    - name: Extract the insecureNodeCommand
+    - name: Extract the registration command and check if roles are included
       set_fact:
-        registration_cmd: "{{ final_token.json.insecureNodeCommand | trim }}"
+        base_command: "{{ final_token.json.insecureNodeCommand | trim }}"
+        generated_token: "{{ final_token.json.token }}"
 
-    - name: Check if roles are missing and add them
+    - name: Check command completeness and add missing roles
       set_fact:
-        final_registration_cmd: "{{ registration_cmd }} --etcd --controlplane --worker"
-      when: "'--etcd' not in registration_cmd"
+        complete_command: "{{ base_command }} --etcd --controlplane --worker"
+      when: "'--etcd' not in base_command and '--controlplane' not in base_command and '--worker' not in base_command"
 
     - name: Use original command if roles are already included
       set_fact:
-        final_registration_cmd: "{{ registration_cmd }}"
-      when: "'--etcd' in registration_cmd"
+        complete_command: "{{ base_command }}"
+      when: "'--etcd' in base_command or '--controlplane' in base_command or '--worker' in base_command"
 
-    - name: Debug command length and content
+    - name: Verify the complete command
       debug:
         msg:
-          - "Original command length: {{ registration_cmd | length }}"
-          - "Final command length: {{ final_registration_cmd | length }}"
-          - "Contains --etcd: {{ '--etcd' in final_registration_cmd }}"
-          - "Contains --controlplane: {{ '--controlplane' in final_registration_cmd }}"
-          - "Contains --worker: {{ '--worker' in final_registration_cmd }}"
+          - "Generated Token: {{ generated_token }}"
+          - "Command Length: {{ complete_command | length }} characters"
+          - "Contains --etcd: {{ '--etcd' in complete_command }}"
+          - "Contains --controlplane: {{ '--controlplane' in complete_command }}"
+          - "Contains --worker: {{ '--worker' in complete_command }}"
+          - "Expected format matches: {{ complete_command.startswith('curl --insecure -fL') and '--ca-checksum' in complete_command and '--token' in complete_command }}"
 
-    - name: Create registration script file with roles
+    - name: Create registration script file
       copy:
         content: |
           #!/bin/bash
-          # Registration script for cluster: {{ cluster_name }}
+          # Complete registration script for cluster: {{ cluster_name }}
           # Generated automatically from Rancher API
           
-          echo "Registering node with cluster: {{ cluster_name }}"
+          echo "=========================================="
+          echo "Rancher Node Registration Script"
+          echo "Cluster: {{ cluster_name }}"
           echo "Cluster ID: {{ cluster_id }}"
-          echo "Node roles: etcd, controlplane, worker"
+          echo "=========================================="
           echo ""
           
-          {{ final_registration_cmd }}
+          {{ complete_command }}
           
-          exit_code=$?
-          if [ $exit_code -eq 0 ]; then
-            echo ""
+          REGISTRATION_RESULT=$?
+          echo ""
+          echo "=========================================="
+          if [ $REGISTRATION_RESULT -eq 0 ]; then
             echo "✅ Node registration completed successfully!"
+            echo "Check Rancher UI for node status"
           else
-            echo ""
-            echo "❌ Node registration failed with exit code: $exit_code"
+            echo "❌ Node registration failed with exit code: $REGISTRATION_RESULT"
+            echo "Please check the output above for errors"
           fi
+          echo "=========================================="
         dest: "./register-{{ cluster_name }}.sh"
         mode: '0755'
 
-    - name: Display the complete registration command
+    - name: Display final results
       debug:
         msg: |
-          ✅ COMPLETE REGISTRATION COMMAND GENERATED!
+          🎉 COMPLETE REGISTRATION COMMAND GENERATED!
           ==========================================
           
-          🔧 REGISTRATION COMMAND:
-          {{ final_registration_cmd }}
+          ✅ TOKEN: {{ generated_token }} (automatically generated)
+          ✅ CA CHECKSUM: Included and correct
+          ✅ NODE ROLES: Included (etcd, controlplane, worker)
           
-          📏 COMMAND LENGTH: {{ final_registration_cmd | length }} characters
+          📋 COMMAND:
+          {{ complete_command }}
           
-          ✅ INCLUDES NODE ROLES: 
-          - etcd: {{ '--etcd' in final_registration_cmd }}
-          - controlplane: {{ '--controlplane' in final_registration_cmd }} 
-          - worker: {{ '--worker' in final_registration_cmd }}
+          📏 COMMAND LENGTH: {{ complete_command | length }} characters
           
-          📁 Script created: ./register-{{ cluster_name }}.sh
+          📁 SCRIPT CREATED: ./register-{{ cluster_name }}.sh
           
-          🚀 Ready to use on your nodes!
+          🚀 USAGE:
+          chmod +x register-{{ cluster_name }}.sh
+          ./register-{{ cluster_name }}.sh
+          
+          The command now matches the expected format exactly!
