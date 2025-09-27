@@ -1,12 +1,15 @@
-- name: Get TRUE Custom Cluster Registration Command
+---
+- name: Get Rancher cluster registration command with correct CA checksum
   hosts: localhost
   gather_facts: false
+
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "custom-cluster"
 
   tasks:
+
     - name: Fetch cluster details
       uri:
         url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
@@ -26,135 +29,132 @@
       set_fact:
         cluster_id: "{{ cluster_list_response.json.data[0].id }}"
 
-    - name: Debug cluster info
-      debug:
-        var: cluster_list_response.json.data[0]
+    - name: Fetch registration tokens for this cluster
+      uri:
+        url: "{{ rancher_url }}/v3/clusterregistrationtokens?clusterId={{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+          Content-Type: "application/json"
+        validate_certs: false
+      register: tokens_response
 
-    - name: Check if this is a custom cluster (imported type)
+    - name: Fail if no registration tokens found
+      fail:
+        msg: "No registration tokens found for cluster {{ cluster_name }}!"
+      when: tokens_response.json.data | length == 0
+
+    - name: Set token fact
       set_fact:
-        is_custom_cluster: "{{ cluster_list_response.json.data[0].type == 'cluster' }}"
+        token: "{{ tokens_response.json.data[0].token }}"
 
-    - name: Get the correct registration command based on cluster type
-      block:
-        - name: Get registration token for custom cluster
-          uri:
-            url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
-            method: POST
-            headers:
-              Authorization: "Bearer {{ api_token }}"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              clusterId: "{{ cluster_id }}"
-            validate_certs: false
-            status_code: 201
-          register: token_response
+    - name: Try to get CA checksum from registration token
+      set_fact:
+        ca_checksum: >-
+          {{ tokens_response.json.data[0].caChecksum
+            | default(tokens_response.json.data[0]['ca-checksum']
+            | default('')) }}
+      ignore_errors: yes
 
-        - name: Wait for token to be ready
-          uri:
-            url: "{{ rancher_url }}/v3/clusterRegistrationTokens/{{ token_response.json.id }}"
-            method: GET
-            headers:
-              Authorization: "Bearer {{ api_token }}"
-            validate_certs: false
-            status_code: 200
-          register: final_token
-          until: final_token.json.command is defined or final_token.json.nodeCommand is defined
-          retries: 10
-          delay: 3
-
-        - name: Debug token response
-          debug:
-            var: final_token.json
-
-        - name: Set registration command based on available fields
-          set_fact:
-            registration_command: "{{ final_token.json.command | default(final_token.json.nodeCommand) }}"
-
-      when: is_custom_cluster
-
-    - name: Display TRUE CUSTOM CLUSTER registration instructions
+    - name: Debug CA checksum from token
       debug:
-        msg:
-          - "✅ TRUE CUSTOM CLUSTER REGISTRATION COMMAND"
-          - "==========================================="
-          - "Cluster: {{ cluster_name }}"
-          - "Cluster ID: {{ cluster_id }}"
-          - "Cluster Type: {{ cluster_list_response.json.data[0].type }}"
-          - ""
-          - "📋 REGISTRATION COMMAND:"
-          - "{{ registration_command }}"
-          - ""
-          - "🚨 IMPORTANT: This is for EXISTING KUBERNETES NODES"
-          - ""
-          - "🔧 PREREQUISITES:"
-          - "1. Install Kubernetes (RKE2/K3s) manually on your nodes"
-          - "2. Configure node roles in your Kubernetes installation"
-          - "3. Ensure kubectl is configured and working"
-          - "4. THEN run the registration command above"
-          - ""
-          - "📖 For RKE2 installation example:"
-          - "   curl -sfL https://get.rke2.io | INSTALL_RKE2_VERSION=v1.27.5+rke2r1 sh -"
-          - "   systemctl enable rke2-server.service"
-          - "   systemctl start rke2-server.service"
+        msg: "CA Checksum from token: {{ ca_checksum }}"
 
-    - name: Save TRUE custom cluster registration instructions
+    - name: Get CA certs from Rancher settings if not found in token
+      uri:
+        url: "{{ rancher_url }}/v3/settings/cacerts"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+          Content-Type: "application/json"
+        validate_certs: false
+      register: ca_certs_response
+      when: ca_checksum == ''
+      ignore_errors: yes
+
+    - name: Calculate CA checksum from PEM (if needed)
+      shell: |
+        echo "{{ ca_certs_response.json.value }}" | openssl x509 -noout -fingerprint -sha256 | cut -d'=' -f2 | tr -d ':' | tr 'A-Z' 'a-z'
+      register: calculated_checksum
+      when:
+        - ca_checksum == ''
+        - ca_certs_response is defined
+        - ca_certs_response.json.value is defined
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Set CA checksum from calculated value
+      set_fact:
+        ca_checksum: "{{ calculated_checksum.stdout }}"
+      when:
+        - ca_checksum == ''
+        - calculated_checksum is defined
+        - calculated_checksum.stdout | length == 64
+
+    - name: Get CA checksum from Rancher server cert as fallback
+      shell: |
+        openssl s_client -connect {{ rancher_url | regex_replace('^https://', '') }}:443 -showcerts </dev/null 2>/dev/null |
+        openssl x509 -noout -fingerprint -sha256 | cut -d'=' -f2 | tr -d ':' | tr 'A-Z' 'a-z'
+      register: openssl_ca_checksum
+      when: ca_checksum == ''
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Set CA checksum from server certificate
+      set_fact:
+        ca_checksum: "{{ openssl_ca_checksum.stdout }}"
+      when:
+        - ca_checksum == ''
+        - openssl_ca_checksum is defined
+        - openssl_ca_checksum.stdout | length == 64
+
+    - name: Final fallback – use empty CA checksum (insecure)
+      set_fact:
+        ca_checksum: ""
+      when: ca_checksum == ''
+
+    - name: Show final CA checksum
+      debug:
+        msg: "✅ Final CA Checksum used: {{ ca_checksum if ca_checksum else 'NONE (insecure mode)' }}"
+
+    - name: Build final multi-line registration command
+      set_fact:
+        registration_cmd: >-
+          curl --insecure -fL "{{ rancher_url }}/system-agent-install.sh" | sudo sh -s - 
+          --server "{{ rancher_url }}" 
+          --label 'cattle.io/os=linux' 
+          --token "{{ token }}"
+          {% if ca_checksum | length == 64 %} --ca-checksum "{{ ca_checksum }}" {% endif %}
+          --etcd --controlplane --worker
+
+    - name: Show registration command
+      debug:
+        msg: "{{ registration_cmd }}"
+
+    - name: Build one-liner registration command
+      set_fact:
+        oneline_registration_cmd: >-
+          curl --insecure -fL {{ rancher_url }}/system-agent-install.sh | sudo sh -s - --server {{ rancher_url }} --label 'cattle.io/os=linux' --token {{ token }} {% if ca_checksum | length == 64 %}--ca-checksum {{ ca_checksum }}{% endif %} --etcd --controlplane --worker
+
+    - name: Show one-liner command
+      debug:
+        msg: "{{ oneline_registration_cmd }}"
+
+    - name: Create local registration script
       copy:
         content: |
-          TRUE CUSTOM CLUSTER REGISTRATION
-          ================================
+          #!/bin/bash
+          {{ registration_cmd }}
+        dest: "./register-{{ cluster_name }}.sh"
+        mode: '0755'
 
-          Cluster: {{ cluster_name }}
-          Cluster ID: {{ cluster_id }}
-          Cluster Type: {{ cluster_list_response.json.data[0].type }}
+    - name: Done – show summary
+      debug:
+        msg: |
+          ✅ Registration command generated!
 
-          IMPORTANT: This cluster requires MANUAL Kubernetes installation first.
+          📁 Script: ./register-{{ cluster_name }}.sh
+          🔑 Token: {{ token }}
+          🔐 CA Checksum: {{ ca_checksum if ca_checksum else 'Not used (insecure mode)' }}
 
-          PREREQUISITES:
-          1. Install Kubernetes (RKE2 or K3s) manually on your nodes
-          2. Configure appropriate node roles during installation
-          3. Ensure Kubernetes is running and healthy
-
-          REGISTRATION COMMAND:
-          {{ registration_command }}
-
-          INSTALLATION EXAMPLES:
-
-          For RKE2 (Control Plane + etcd node):
-          -------------------------------------
-          curl -sfL https://get.rke2.io | INSTALL_RKE2_VERSION=v1.27.5+rke2r1 sh -
-          mkdir -p /etc/rancher/rke2/
-          cat > /etc/rancher/rke2/config.yaml << EOF
-          token: my-shared-secret
-          node-taint:
-            - "CriticalAddonsOnly=true:NoExecute"
-          node-label:
-            - "node-role.kubernetes.io/control-plane=true"
-            - "node-role.kubernetes.io/etcd=true"
-          EOF
-          systemctl enable rke2-server.service
-          systemctl start rke2-server.service
-
-          For RKE2 (Worker node):
-          -----------------------
-          curl -sfL https://get.rke2.io | INSTALL_RKE2_VERSION=v1.27.5+rke2r1 sh -
-          mkdir -p /etc/rancher/rke2/
-          cat > /etc/rancher/rke2/config.yaml << EOF
-          token: my-shared-secret
-          server: https://<control-plane-ip>:9345
-          node-label:
-            - "node-role.kubernetes.io/worker=true"
-          EOF
-          systemctl enable rke2-agent.service
-          systemctl start rke2-agent.service
-
-          For K3s:
-          --------
-          curl -sfL https://get.k3s.io | sh -
-          # K3s automatically registers with embedded etcd and control plane
-
-          AFTER KUBERNETES IS INSTALLED AND RUNNING:
-          ------------------------------------------
-          Run the registration command above to connect to Rancher.
-        dest: "./true-custom-cluster-{{ cluster_name }}-instructions.txt"
-        mode: '0644'
+          👉 Run this script on the node to register it!
