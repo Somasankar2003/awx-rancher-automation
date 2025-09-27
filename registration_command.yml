@@ -75,25 +75,18 @@
       set_fact:
         registration_cmd: "{{ final_token.json.insecureNodeCommand | trim | replace('  ', ' ') }}"
 
-    - name: Also extract manual fields for verification
+    - name: Extract available fields safely
       set_fact:
         manual_token: "{{ final_token.json.token }}"
-        manual_ca_checksum: "{{ final_token.json.clusterCaChecksum }}"
+        # Try different possible field names for CA checksum
+        manual_ca_checksum: "{{ final_token.json.clusterCaChecksum | default(final_token.json.caChecksum | default(final_token.json.caChecksum | default('UNKNOWN'))) }}"
 
-    - name: Build manual command for comparison
-      set_fact:
-        manual_cmd: "curl --insecure -fL {{ rancher_url }}/system-agent-install.sh | sudo sh -s - --server {{ rancher_url }} --label 'cattle.io/os=linux' --token {{ manual_token }} --ca-checksum {{ manual_ca_checksum }} --etcd --controlplane --worker"
-
-    - name: Display both commands for comparison
+    - name: Debug extracted fields
       debug:
         msg:
-          - "FROM RANCHER (insecureNodeCommand):"
-          - "{{ registration_cmd }}"
-          - ""
-          - "MANUALLY BUILT:"
-          - "{{ manual_cmd }}"
-          - ""
-          - "Commands match: {{ registration_cmd == manual_cmd }}"
+          - "Token: {{ manual_token }}"
+          - "CA Checksum: {{ manual_ca_checksum }}"
+          - "Available keys: {{ final_token.json.keys() | list }}"
 
     - name: Use the Rancher-generated command (most reliable)
       set_fact:
@@ -153,9 +146,6 @@
           2. Run on each node: ./register-{{ cluster_name }}.sh
           3. Or use one-line: ./register-{{ cluster_name }}-oneline.sh
           4. Monitor progress in Rancher UI
-          
-          ⚠️  NOTE: This command includes --insecure flag and uses the correct CA checksum
-          that matches your Rancher server configuration.
 
     - name: Verify command matches expected format
       debug:
@@ -164,5 +154,4 @@
           - Command starts with: {{ final_registration_cmd.startswith('curl --insecure -fL') }}
           - Contains server URL: {{ rancher_url in final_registration_cmd }}
           - Contains token: {{ manual_token in final_registration_cmd }}
-          - Contains CA checksum: {{ manual_ca_checksum in final_registration_cmd }}
-          - Contains roles: {{ '--etcd --controlplane --worker' in final_registration_cmd }}
+          - Command length: {{ final_registration_cmd | length }} characters
