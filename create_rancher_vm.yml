@@ -12,7 +12,7 @@
 
     # Surveyed variables from AWX
     vm_count: "{{ vm_count | int }}"
-    node_roles: "{{ node_roles }}"  # e.g. "etcd,controlplane,worker"
+    node_roles: "{{ node_roles }}"  # Comma-separated string from survey (e.g. "etcd,etcd,controlplane,controlplane,worker")
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
 
@@ -71,7 +71,7 @@
         dest: "/tmp/{{ cluster_name }}-vm-roles.txt"
       delegate_to: localhost
 
-    - name: Check if cluster exists in Rancher
+    - name: Get cluster ID from Rancher
       uri:
         url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
         method: GET
@@ -80,12 +80,6 @@
           Content-Type: "application/json"
         validate_certs: no
       register: cluster_info
-      failed_when: false
-
-    - name: Fail if cluster not found
-      fail:
-        msg: "Cluster '{{ cluster_name }}' not found in Rancher. Please create it manually via Rancher UI before running this playbook."
-      when: cluster_info.json.data | length == 0
 
     - name: Extract cluster ID
       set_fact:
