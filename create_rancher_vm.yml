@@ -12,7 +12,7 @@
 
     # Surveyed variables from AWX
     vm_count: "{{ vm_count | int }}"
-    node_roles: "{{ node_roles }}"
+    node_roles: "{{ node_roles }}"  # Comma-separated string from survey (e.g. "etcd,etcd,controlplane,controlplane,worker")
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
 
@@ -46,17 +46,6 @@
           - parsed_roles | length == vm_count
         fail_msg: "node_roles must contain exactly {{ vm_count }} comma-separated roles. Got: {{ parsed_roles | length }}"
 
-    - name: Validate we have at least one of each required role
-      assert:
-        that:
-          - parsed_roles | select('match', '.*etcd.*') | list | length >= 1
-          - parsed_roles | select('match', '.*controlplane.*') | list | length >= 1
-          - parsed_roles | select('match', '.*worker.*') | list | length >= 1
-        fail_msg: |
-          Must have at least one node with each role: etcd, controlplane, and worker.
-          Current roles: {{ parsed_roles }}
-          Example: "etcd,controlplane,worker" for 3 nodes
-
     - name: Generate VM list
       set_fact:
         vm_list: "{{ query('sequence', 'start=1 end=' + vm_count|string) }}"
@@ -70,14 +59,17 @@
         msg: "VM rancher-node-{{ item.0 }} will be assigned role(s): {{ item.1 }}"
       loop: "{{ vm_role_map }}"
 
-    - name: Show role summary
-      debug:
-        msg: |
-          📊 ROLE DISTRIBUTION SUMMARY:
-          - etcd nodes: {{ parsed_roles | select('match', '.*etcd.*') | list | length }}
-          - controlplane nodes: {{ parsed_roles | select('match', '.*controlplane.*') | list | length }}
-          - worker nodes: {{ parsed_roles | select('match', '.*worker.*') | list | length }}
-          - Total VMs: {{ vm_count }}
+    - name: Save VM role map to file
+      copy:
+        content: |
+          Cluster: {{ cluster_name }}
+          VM Role Assignment
+          ------------------
+          {% for vm in vm_role_map %}
+          rancher-node-{{ vm.0 }}: {{ vm.1 }}
+          {% endfor %}
+        dest: "/tmp/{{ cluster_name }}-vm-roles.txt"
+      delegate_to: localhost
 
     - name: Get cluster ID from Rancher
       uri:
@@ -88,64 +80,26 @@
           Content-Type: "application/json"
         validate_certs: no
       register: cluster_info
-      retries: 5
-      delay: 10
-
-    - name: Debug cluster info
-      debug:
-        var: cluster_info.json
-
-    - name: Fail if cluster not found
-      fail:
-        msg: "Cluster '{{ cluster_name }}' not found in Rancher!"
-      when: cluster_info.json.data | length == 0
 
     - name: Extract cluster ID
       set_fact:
         cluster_id: "{{ cluster_info.json.data[0].id }}"
 
-    - name: Get or create registration token
+    - name: Get registration token from Rancher
       uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ rancher_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          clusterId: "{{ cluster_id }}"
-        validate_certs: no
-        status_code: 201
-      register: token_create
-      ignore_errors: yes
-
-    - name: Wait for registration token to be ready
-      uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
+        url: "{{ rancher_url }}/v3/clusterregistrationtokens?clusterId={{ cluster_id }}"
         method: GET
         headers:
           Authorization: "Bearer {{ rancher_token }}"
           Content-Type: "application/json"
         validate_certs: no
       register: reg_info
-      until: >
-        reg_info.json.data[0].nodeCommand is defined
-      retries: 15
-      delay: 5
 
-    - name: Debug registration token info
-      debug:
-        msg: |
-          Registration Token Details:
-          - Token: {{ reg_info.json.data[0].token }}
-          - Node Command: {{ reg_info.json.data[0].nodeCommand }}
-
-    - name: Extract registration commands from API response
+    - name: Set base registration command
       set_fact:
-        node_command: "{{ reg_info.json.data[0].nodeCommand }}"
-        registration_token: "{{ reg_info.json.data[0].token }}"
+        base_registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --label 'cattle.io/os=linux'"
 
-    - name: Create cloud-init files with PROPER role assignment
+    - name: Create cloud-init files per VM with role-based registration
       copy:
         dest: "/tmp/cloud-init-rancher-node-{{ item.0 }}.yml"
         content: |
@@ -155,51 +109,12 @@
             - curl
           runcmd:
             - curl -fsSL https://get.docker.com | sh
-            - systemctl enable docker
-            - systemctl start docker
-            - usermod -aG docker ubuntu
-            - sleep 30
-            - |
-              # Extract base command without roles
-              BASE_CMD="{{ node_command }}"
-              # Remove existing role flags if any
-              CLEAN_CMD=$(echo "$BASE_CMD" | sed 's/--etcd//g' | sed 's/--controlplane//g' | sed 's/--worker//g')
-              # Add specific roles for this node
-              FINAL_CMD="$CLEAN_CMD"
-              {% if 'etcd' in item.1 %}
-              FINAL_CMD="$FINAL_CMD --etcd"
-              {% endif %}
-              {% if 'controlplane' in item.1 %}
-              FINAL_CMD="$FINAL_CMD --controlplane"
-              {% endif %}
-              {% if 'worker' in item.1 %}
-              FINAL_CMD="$FINAL_CMD --worker"
-              {% endif %}
-              FINAL_CMD="$FINAL_CMD --node-name rancher-node-{{ item.0 }}"
-              echo "Executing: $FINAL_CMD"
-              eval $FINAL_CMD
+            - usermod -aG docker ubuntu || true
+            - sleep 15
+            - "{{ base_registration_command }} {{ '--' + item.1.replace('+', ' --') }}"
       loop: "{{ vm_role_map }}"
       loop_control:
         label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
-
-    - name: Save role-specific registration commands
-      copy:
-        content: |
-          ROLE-SPECIFIC REGISTRATION COMMANDS
-          ===================================
-          Base Command: {{ node_command }}
-          
-          VM Specific Commands:
-          {% for vm in vm_role_map %}
-          rancher-node-{{ vm.0 }} ({{ vm.1 }}):
-          {{ node_command | regex_replace('--etcd|--controlplane|--worker', '') }} \
-          {% if 'etcd' in vm.1 %}--etcd {% endif %}\
-          {% if 'controlplane' in vm.1 %}--controlplane {% endif %}\
-          {% if 'worker' in vm.1 %}--worker {% endif %}\
-          --node-name rancher-node-{{ vm.0 }}
-          {% endfor %}
-        dest: "/tmp/{{ cluster_name }}-role-commands.txt"
-      delegate_to: localhost
 
     - name: Create VMs on OpenStack with cloud-init
       os_server:
@@ -212,7 +127,6 @@
           - net-id: "{{ vm_net }}"
         userdata: "{{ lookup('file', '/tmp/cloud-init-rancher-node-' + item.0|string + '.yml') }}"
         auto_ip: yes
-        timeout: 600
         cloud:
           auth:
             auth_url: "{{ os_auth_url }}"
@@ -233,76 +147,3 @@
       loop: "{{ vm_role_map }}"
       loop_control:
         label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
-
-    - name: Wait for nodes to register in Rancher (15 minute timeout)
-      uri:
-        url: "{{ rancher_url }}/v3/nodes?clusterId={{ cluster_id }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ rancher_token }}"
-          Content-Type: "application/json"
-        validate_certs: no
-      register: rancher_nodes
-      until: >
-        (rancher_nodes.json.data | length >= vm_count) and
-        (rancher_nodes.json.data | selectattr('etcd') | list | length >= 1) and
-        (rancher_nodes.json.data | selectattr('controlPlane') | list | length >= 1) and
-        (rancher_nodes.json.data | selectattr('worker') | list | length >= 1)
-      retries: 90
-      delay: 10
-      ignore_errors: yes
-
-    - name: Show final registration status with role verification
-      debug:
-        msg: |
-          🎯 CLUSTER STATUS: {{ cluster_name }}
-          ================================
-          Expected VMs: {{ vm_count }}
-          Registered in Rancher: {{ rancher_nodes.json.data | length }}
-          
-          Role Distribution:
-          - etcd nodes: {{ rancher_nodes.json.data | selectattr('etcd') | list | length }}
-          - controlplane nodes: {{ rancher_nodes.json.data | selectattr('controlPlane') | list | length }}
-          - worker nodes: {{ rancher_nodes.json.data | selectattr('worker') | list | length }}
-          
-          {% set etcd_count = rancher_nodes.json.data | selectattr('etcd') | list | length %}
-          {% set cp_count = rancher_nodes.json.data | selectattr('controlPlane') | list | length %}
-          {% set worker_count = rancher_nodes.json.data | selectattr('worker') | list | length %}
-          
-          {% if etcd_count >= 1 and cp_count >= 1 and worker_count >= 1 %}
-          ✅ SUCCESS: Cluster has all required roles!
-          {% else %}
-          ❌ CLUSTER INCOMPLETE: Missing required roles
-          {% endif %}
-
-    - name: Display detailed node information
-      debug:
-        msg: |
-          📋 NODE DETAILS:
-          {% for node in rancher_nodes.json.data %}
-          - {{ node.name }}:
-            State: {{ node.state }}
-            Roles: etcd={{ node.etcd }}, controlplane={{ node.controlPlane }}, worker={{ node.worker }}
-            Conditions: {{ node.conditions | map(attribute='type') | join(', ') }}
-          {% endfor %}
-
-    - name: Check cluster provisioning status
-      uri:
-        url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ rancher_token }}"
-          Content-Type: "application/json"
-        validate_certs: no
-      register: cluster_status
-
-    - name: Display cluster state
-      debug:
-        msg: |
-          🏷️ CLUSTER STATE:
-          - Name: {{ cluster_status.json.name }}
-          - State: {{ cluster_status.json.state }}
-          - Conditions: 
-          {% for condition in cluster_status.json.conditions %}
-            - {{ condition.type }}: {{ condition.status }} ({{ condition.message }})
-          {% endfor %}
