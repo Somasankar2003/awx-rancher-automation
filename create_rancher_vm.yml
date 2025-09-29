@@ -9,10 +9,12 @@
     rancher_url: "https://192.168.170.67"
     rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "{{ cluster_name }}"
+    # Hardcoded correct checksum from your registration script
+    correct_checksum: "6084395a78f897c01300c9fa486331eb81316b8271d7c45c64323eab518b51c0"
 
     # Surveyed variables from AWX
     vm_count: "{{ vm_count | int }}"
-    node_roles: "{{ node_roles }}"  # Comma-separated string from survey (e.g. "etcd,etcd,controlplane,controlplane,worker")
+    node_roles: "{{ node_roles }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
 
@@ -59,18 +61,6 @@
         msg: "VM rancher-node-{{ item.0 }} will be assigned role(s): {{ item.1 }}"
       loop: "{{ vm_role_map }}"
 
-    - name: Save VM role map to file
-      copy:
-        content: |
-          Cluster: {{ cluster_name }}
-          VM Role Assignment
-          ------------------
-          {% for vm in vm_role_map %}
-          rancher-node-{{ vm.0 }}: {{ vm.1 }}
-          {% endfor %}
-        dest: "/tmp/{{ cluster_name }}-vm-roles.txt"
-      delegate_to: localhost
-
     - name: Get cluster ID from Rancher
       uri:
         url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
@@ -80,6 +70,10 @@
           Content-Type: "application/json"
         validate_certs: no
       register: cluster_info
+
+    - name: Debug cluster info
+      debug:
+        var: cluster_info.json
 
     - name: Extract cluster ID
       set_fact:
@@ -95,11 +89,23 @@
         validate_certs: no
       register: reg_info
 
-    - name: Set base registration command
-      set_fact:
-        base_registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --label 'cattle.io/os=linux'"
+    - name: Debug registration token info
+      debug:
+        var: reg_info.json.data[0]
 
-    - name: Create cloud-init files per VM with role-based registration
+    - name: Extract token from response
+      set_fact:
+        registration_token: "{{ reg_info.json.data[0].token }}"
+
+    - name: Build proper registration command with CA checksum
+      set_fact:
+        base_registration_command: "curl --insecure -fL {{ rancher_url }}/system-agent-install.sh | sudo sh -s - --server {{ rancher_url }} --label 'cattle.io/os=linux' --token {{ registration_token }} --ca-checksum {{ correct_checksum }}"
+
+    - name: Debug base registration command
+      debug:
+        var: base_registration_command
+
+    - name: Create cloud-init files per VM with FIXED registration
       copy:
         dest: "/tmp/cloud-init-rancher-node-{{ item.0 }}.yml"
         content: |
@@ -109,12 +115,37 @@
             - curl
           runcmd:
             - curl -fsSL https://get.docker.com | sh
-            - usermod -aG docker ubuntu || true
-            - sleep 15
-            - "{{ base_registration_command }} {{ '--' + item.1.replace('+', ' --') }}"
+            - systemctl enable docker
+            - systemctl start docker
+            - usermod -aG docker ubuntu
+            - sleep 30  # Wait for docker to be fully ready
+            - |
+              # Build the complete registration command with roles
+              {{ base_registration_command }} \
+              {% if 'etcd' in item.1 %}--etcd {% endif %}\
+              {% if 'controlplane' in item.1 %}--controlplane {% endif %}\
+              {% if 'worker' in item.1 %}--worker {% endif %}\
+              --node-name rancher-node-{{ item.0 }}
       loop: "{{ vm_role_map }}"
       loop_control:
         label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
+
+    - name: Save registration commands for debugging
+      copy:
+        content: |
+          Registration Commands for {{ cluster_name }}
+          ==========================================
+          {% for vm in vm_role_map %}
+          rancher-node-{{ vm.0 }} ({{ vm.1 }}):
+          {{ base_registration_command }} \
+          {% if 'etcd' in vm.1 %}--etcd {% endif %}\
+          {% if 'controlplane' in vm.1 %}--controlplane {% endif %}\
+          {% if 'worker' in vm.1 %}--worker {% endif %}\
+          --node-name rancher-node-{{ vm.0 }}
+
+          {% endfor %}
+        dest: "/tmp/{{ cluster_name }}-registration-commands.txt"
+      delegate_to: localhost
 
     - name: Create VMs on OpenStack with cloud-init
       os_server:
@@ -127,6 +158,7 @@
           - net-id: "{{ vm_net }}"
         userdata: "{{ lookup('file', '/tmp/cloud-init-rancher-node-' + item.0|string + '.yml') }}"
         auto_ip: yes
+        timeout: 600
         cloud:
           auth:
             auth_url: "{{ os_auth_url }}"
@@ -147,3 +179,39 @@
       loop: "{{ vm_role_map }}"
       loop_control:
         label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
+
+    - name: Wait for nodes to register in Rancher
+      uri:
+        url: "{{ rancher_url }}/v3/nodes?clusterId={{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+          Content-Type: "application/json"
+        validate_certs: no
+      register: rancher_nodes
+      until: rancher_nodes.json.data | length >= vm_count
+      retries: 30
+      delay: 10
+      ignore_errors: yes
+
+    - name: Show registration status
+      debug:
+        msg: |
+          📊 RANCHER REGISTRATION STATUS:
+          Expected nodes: {{ vm_count }}
+          Registered nodes: {{ rancher_nodes.json.data | length }}
+          {% if rancher_nodes.json.data | length >= vm_count %}
+          ✅ SUCCESS: All nodes registered successfully!
+          {% else %}
+          ⚠️ WARNING: Only {{ rancher_nodes.json.data | length }}/{{ vm_count }} nodes registered.
+          Nodes may still be provisioning...
+          {% endif %}
+
+    - name: Display registered node details
+      debug:
+        msg: |
+          {% for node in rancher_nodes.json.data %}
+          Node: {{ node.name }}
+          - State: {{ node.state }}
+          - Roles: etcd={{ node.etcd }}, controlplane={{ node.controlPlane }}, worker={{ node.worker }}
+          {% endfor %}
