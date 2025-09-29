@@ -12,7 +12,7 @@
 
     # Surveyed variables from AWX
     vm_count: "{{ vm_count | int }}"
-    node_roles: "{{ node_roles }}"  # Comma-separated string from survey
+    node_roles: "{{ node_roles }}"  # Comma-separated string from survey (e.g. "etcd,etcd,controlplane,controlplane,worker")
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
 
@@ -53,6 +53,23 @@
     - name: Combine VM index and role
       set_fact:
         vm_role_map: "{{ vm_list | zip(parsed_roles) | list }}"
+
+    - name: Display VM-to-Role assignment
+      debug:
+        msg: "VM rancher-node-{{ item.0 }} will be assigned role(s): {{ item.1 }}"
+      loop: "{{ vm_role_map }}"
+
+    - name: Save VM role map to file
+      copy:
+        content: |
+          Cluster: {{ cluster_name }}
+          VM Role Assignment
+          ------------------
+          {% for vm in vm_role_map %}
+          rancher-node-{{ vm.0 }}: {{ vm.1 }}
+          {% endfor %}
+        dest: "/tmp/{{ cluster_name }}-vm-roles.txt"
+      delegate_to: localhost
 
     - name: Get cluster ID from Rancher
       uri:
