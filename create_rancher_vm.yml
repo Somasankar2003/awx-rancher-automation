@@ -8,15 +8,16 @@
     # Rancher details
     rancher_url: "https://192.168.170.67"
     rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
-    cluster_name: "{{ cluster_name }}"   # <-- From AWX survey now
+    cluster_name: "{{ cluster_name }}"
 
-    # Surveyed variables from AWX or CLI
+    # Surveyed variables from AWX
     vm_count: "{{ vm_count | int }}"
+    node_roles: "{{ node_roles }}"  # Comma-separated string from survey
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
 
     # Static VM details
-    vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"   # <-- Hardcoded back
+    vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
     vm_keypair: "rke"
 
     # OpenStack authentication
@@ -29,14 +30,29 @@
     os_region_name: "RegionOne"
 
   tasks:
+
     - name: Validate vm_count is a positive integer
       fail:
         msg: "vm_count must be a positive integer. Got {{ vm_count }}."
       when: vm_count < 1
 
+    - name: Convert comma-separated roles string into a list
+      set_fact:
+        parsed_roles: "{{ node_roles.split(',') }}"
+
+    - name: Validate node_roles length matches vm_count
+      assert:
+        that:
+          - parsed_roles | length == vm_count
+        fail_msg: "node_roles must contain exactly {{ vm_count }} comma-separated roles. Got: {{ parsed_roles | length }}"
+
     - name: Generate VM list
       set_fact:
         vm_list: "{{ query('sequence', 'start=1 end=' + vm_count|string) }}"
+
+    - name: Combine VM index and role
+      set_fact:
+        vm_role_map: "{{ vm_list | zip(parsed_roles) | list }}"
 
     - name: Get cluster ID from Rancher
       uri:
@@ -62,13 +78,13 @@
         validate_certs: no
       register: reg_info
 
-    - name: Set registration command
+    - name: Set base registration command
       set_fact:
-        registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --etcd --controlplane --worker --label 'cattle.io/os=linux'"
+        base_registration_command: "{{ reg_info.json.data[0].insecureNodeCommand }} --label 'cattle.io/os=linux'"
 
-    - name: Create cloud-init user_data files
+    - name: Create cloud-init files per VM with role-based registration
       copy:
-        dest: "/tmp/cloud-init-rancher-node-{{ item }}.yml"
+        dest: "/tmp/cloud-init-rancher-node-{{ item.0 }}.yml"
         content: |
           #cloud-config
           package_update: true
@@ -78,21 +94,21 @@
             - curl -fsSL https://get.docker.com | sh
             - usermod -aG docker ubuntu || true
             - sleep 15
-            - {{ registration_command }}
-      loop: "{{ vm_list }}"
+            - "{{ base_registration_command }} {{ '--' + item.1.replace('+', ' --') }}"
+      loop: "{{ vm_role_map }}"
       loop_control:
-        label: "rancher-node-{{ item }}"
+        label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
 
     - name: Create VMs on OpenStack with cloud-init
       os_server:
         state: present
-        name: "rancher-node-{{ item }}"
+        name: "rancher-node-{{ item.0 }}"
         image: "{{ vm_image }}"
         flavor: "{{ vm_flavor }}"
         key_name: "{{ vm_keypair }}"
         nics:
           - net-id: "{{ vm_net }}"
-        userdata: "{{ lookup('file', '/tmp/cloud-init-rancher-node-' + item|string + '.yml') }}"
+        userdata: "{{ lookup('file', '/tmp/cloud-init-rancher-node-' + item.0|string + '.yml') }}"
         auto_ip: yes
         cloud:
           auth:
@@ -104,13 +120,13 @@
             password: "{{ os_password }}"
           region_name: "{{ os_region_name }}"
       register: new_vms
-      loop: "{{ vm_list }}"
+      loop: "{{ vm_role_map }}"
       loop_control:
-        label: "rancher-node-{{ item }}"
+        label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
 
     - name: Show created VM details
       debug:
-        msg: "VM rancher-node-{{ item }} created with IP {{ new_vms.results[item | int - 1].server.public_v4 | default(new_vms.results[item | int - 1].server.private_v4) | default('No IP assigned') }}"
-      loop: "{{ vm_list }}"
+        msg: "✅ VM rancher-node-{{ item.0 }} (role: {{ item.1 }}) created with IP {{ new_vms.results[item.0 | int - 1].server.public_v4 | default(new_vms.results[item.0 | int - 1].server.private_v4) | default('No IP assigned') }}"
+      loop: "{{ vm_role_map }}"
       loop_control:
-        label: "rancher-node-{{ item }}"
+        label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
