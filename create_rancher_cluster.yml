@@ -6,7 +6,7 @@
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
     cluster_name: "custom-cluster"
-    kubernetes_version: "v1.33.1+rke2r1"
+    kubernetes_version: "v1.33.4+rke2r1"
 
   tasks:
     - name: Display survey inputs
