@@ -130,7 +130,7 @@
       debug:
         msg: "📝 NODE COMMAND: {{ node_command }}"
 
-    - name: Create cloud-init files with SIMPLIFIED registration
+    - name: Create cloud-init files with INSECURE registration
       copy:
         dest: "/tmp/cloud-init-rancher-node-{{ item.0 }}.yml"
         content: |
@@ -150,13 +150,14 @@
             - usermod -aG docker ubuntu
             - sleep 10
             - |
-              echo "=== Installing Rancher System Agent ==="
-              # Use the exact node command from Rancher
+              echo "=== Installing Rancher System Agent with INSECURE flag ==="
+              # Use the exact node command from Rancher and add --insecure flag
               {{ node_command }} \
               {% if 'etcd' in item.1 %}--etcd {% endif %}\
               {% if 'controlplane' in item.1 %}--controlplane {% endif %}\
               {% if 'worker' in item.1 %}--worker {% endif %}\
-              --node-name rancher-node-{{ item.0 }}
+              --node-name rancher-node-{{ item.0 }} \
+              --insecure
             - |
               echo "=== Registration Command Executed ==="
               echo "Waiting for agent to start..."
@@ -176,8 +177,8 @@
     - name: Save registration commands for manual testing
       copy:
         content: |
-          MANUAL REGISTRATION COMMANDS
-          ============================
+          MANUAL REGISTRATION COMMANDS (WITH INSECURE)
+          ===========================================
           Cluster: {{ cluster_name }}
           Cluster ID: {{ cluster_id }}
           Token: {{ registration_token }}
@@ -190,7 +191,8 @@
           {% if 'etcd' in vm.1 %}--etcd {% endif %}\
           {% if 'controlplane' in vm.1 %}--controlplane {% endif %}\
           {% if 'worker' in vm.1 %}--worker {% endif %}\
-          --node-name rancher-node-{{ vm.0 }}
+          --node-name rancher-node-{{ vm.0 }} \
+          --insecure
           
           {% endfor %}
         dest: "/tmp/{{ cluster_name }}-manual-commands.txt"
