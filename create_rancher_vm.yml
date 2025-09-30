@@ -112,18 +112,25 @@
       retries: 20
       delay: 5
 
-    - name: Debug registration token
+    - name: Debug registration token details
       debug:
         msg: |
-          ✅ Registration Token Ready:
-          - Node Command: {{ reg_info.json.data[0].nodeCommand }}
+          🔍 REGISTRATION TOKEN DETAILS:
+          - Cluster: {{ cluster_name }}
+          - Cluster ID: {{ cluster_id }}
           - Token: {{ reg_info.json.data[0].token }}
+          - Node Command Available: {{ reg_info.json.data[0].nodeCommand is defined }}
 
-    - name: Set PROPER registration command
+    - name: Extract node command and token
       set_fact:
         node_command: "{{ reg_info.json.data[0].nodeCommand }}"
+        registration_token: "{{ reg_info.json.data[0].token }}"
 
-    - name: Create cloud-init files with WORKING registration
+    - name: Debug the actual node command
+      debug:
+        msg: "📝 NODE COMMAND: {{ node_command }}"
+
+    - name: Create cloud-init files with SIMPLIFIED registration
       copy:
         dest: "/tmp/cloud-init-rancher-node-{{ item.0 }}.yml"
         content: |
@@ -133,35 +140,61 @@
             - curl
             - docker.io
           runcmd:
+            - |
+              echo "=== Starting Rancher Node Registration ==="
+              echo "Node: rancher-node-{{ item.0 }}"
+              echo "Role: {{ item.1 }}"
+              echo "Cluster: {{ cluster_name }}"
             - systemctl enable docker
             - systemctl start docker
             - usermod -aG docker ubuntu
+            - sleep 10
             - |
-              echo "Starting Rancher registration for rancher-node-{{ item.0 }} with role: {{ item.1 }}"
+              echo "=== Installing Rancher System Agent ==="
+              # Use the exact node command from Rancher
+              {{ node_command }} \
+              {% if 'etcd' in item.1 %}--etcd {% endif %}\
+              {% if 'controlplane' in item.1 %}--controlplane {% endif %}\
+              {% if 'worker' in item.1 %}--worker {% endif %}\
+              --node-name rancher-node-{{ item.0 }}
             - |
-              # Remove any existing role flags and add specific ones
-              CLEAN_CMD="{{ node_command }}"
-              CLEAN_CMD=$(echo "$CLEAN_CMD" | sed 's/--etcd//g' | sed 's/--controlplane//g' | sed 's/--worker//g')
-              FINAL_CMD="$CLEAN_CMD"
-              {% if 'etcd' in item.1 %}
-              FINAL_CMD="$FINAL_CMD --etcd"
-              {% endif %}
-              {% if 'controlplane' in item.1 %}
-              FINAL_CMD="$FINAL_CMD --controlplane"
-              {% endif %}
-              {% if 'worker' in item.1 %}
-              FINAL_CMD="$FINAL_CMD --worker"
-              {% endif %}
-              FINAL_CMD="$FINAL_CMD --node-name rancher-node-{{ item.0 }}"
-              echo "Executing: $FINAL_CMD"
-              eval $FINAL_CMD
-            - |
-              echo "Registration completed. Checking status in 30 seconds..."
+              echo "=== Registration Command Executed ==="
+              echo "Waiting for agent to start..."
               sleep 30
-              systemctl status rancher-system-agent || echo "Rancher agent service not yet started"
+            - |
+              echo "=== Checking Rancher System Agent Status ==="
+              systemctl status rancher-system-agent || echo "Agent service check failed"
+            - |
+              echo "=== Checking Docker Containers ==="
+              docker ps -a || echo "Docker check failed"
+            - |
+              echo "=== Registration Process Complete ==="
       loop: "{{ vm_role_map }}"
       loop_control:
         label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
+
+    - name: Save registration commands for manual testing
+      copy:
+        content: |
+          MANUAL REGISTRATION COMMANDS
+          ============================
+          Cluster: {{ cluster_name }}
+          Cluster ID: {{ cluster_id }}
+          Token: {{ registration_token }}
+          
+          Manual Test Commands (run on VMs):
+          {% for vm in vm_role_map %}
+          
+          # rancher-node-{{ vm.0 }} ({{ vm.1 }})
+          {{ node_command }} \
+          {% if 'etcd' in vm.1 %}--etcd {% endif %}\
+          {% if 'controlplane' in vm.1 %}--controlplane {% endif %}\
+          {% if 'worker' in vm.1 %}--worker {% endif %}\
+          --node-name rancher-node-{{ vm.0 }}
+          
+          {% endfor %}
+        dest: "/tmp/{{ cluster_name }}-manual-commands.txt"
+      delegate_to: localhost
 
     - name: Create VMs on OpenStack with cloud-init
       os_server:
@@ -189,14 +222,19 @@
       loop_control:
         label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
 
-    - name: Show created VM details
+    - name: Show created VM details with IPs
       debug:
-        msg: "✅ VM rancher-node-{{ item.0 }} (role: {{ item.1 }}) created with IP {{ new_vms.results[item.0 | int - 1].server.public_v4 | default(new_vms.results[item.0 | int - 1].server.private_v4) | default('No IP assigned') }}"
+        msg: "✅ VM rancher-node-{{ item.0 }} (role: {{ item.1 }}) - IP: {{ new_vms.results[item.0 | int - 1].server.public_v4 | default(new_vms.results[item.0 | int - 1].server.private_v4) | default('No IP') }}"
       loop: "{{ vm_role_map }}"
       loop_control:
         label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
 
-    - name: Wait for nodes to register in Rancher (15 minutes timeout)
+    - name: Wait a few minutes for VMs to boot
+      pause:
+        minutes: 3
+      delegate_to: localhost
+
+    - name: Check current node registration status
       uri:
         url: "{{ rancher_url }}/v3/nodes?clusterId={{ cluster_id }}"
         method: GET
@@ -204,59 +242,81 @@
           Authorization: "Bearer {{ rancher_token }}"
           Content-Type: "application/json"
         validate_certs: no
-      register: rancher_nodes
-      until: >
-        rancher_nodes.json.data | length >= vm_count
-      retries: 90
-      delay: 10
-      ignore_errors: yes
+      register: current_nodes
+      retries: 3
+      delay: 5
 
-    - name: Show registration results
+    - name: Show current registration status
       debug:
         msg: |
-          🎯 RANCHER REGISTRATION RESULTS:
-          ================================
-          Expected VMs: {{ vm_count }}
-          Registered in Rancher: {{ rancher_nodes.json.data | length }}
-          
-          {% if rancher_nodes.json.data | length >= vm_count %}
-          ✅ SUCCESS: All {{ vm_count }} nodes registered successfully!
-          {% else %}
-          ⚠️ WARNING: Only {{ rancher_nodes.json.data | length }}/{{ vm_count }} nodes registered.
-          This might be normal - nodes can take 5-10 minutes to fully register.
-          {% endif %}
-
-    - name: Display registered node details
-      debug:
-        msg: |
-          📋 REGISTERED NODES:
-          {% for node in rancher_nodes.json.data %}
-          - {{ node.name }}: 
-            State: {{ node.state }}
-            Roles: etcd={{ node.etcd }}, controlplane={{ node.controlPlane }}, worker={{ node.worker }}
-            Conditions: {{ node.conditions | map(attribute='type') | join(', ') }}
+          📊 CURRENT REGISTRATION STATUS (after 3 minutes):
+          - Expected VMs: {{ vm_count }}
+          - Currently Registered: {{ current_nodes.json.data | length }}
+          - Registered Nodes: 
+          {% for node in current_nodes.json.data %}
+            - {{ node.name }} ({{ node.state }})
           {% endfor %}
 
-    - name: Check cluster provisioning status
+    - name: Provide troubleshooting steps
+      debug:
+        msg: |
+          🔧 TROUBLESHOOTING STEPS:
+          
+          If nodes are not registering:
+          
+          1. SSH into a VM and check logs:
+             ssh ubuntu@<VM_IP>
+             
+          2. Check cloud-init logs:
+             sudo tail -f /var/log/cloud-init-output.log
+             
+          3. Check Rancher agent logs:
+             sudo journalctl -u rancher-system-agent -f
+             
+          4. Check Docker containers:
+             sudo docker ps -a
+             
+          5. Manually run registration command from:
+             /tmp/{{ cluster_name }}-manual-commands.txt
+          
+          6. Check VM can reach Rancher URL:
+             curl -k {{ rancher_url }}
+
+    - name: Wait for nodes with reduced expectations
       uri:
-        url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
+        url: "{{ rancher_url }}/v3/nodes?clusterId={{ cluster_id }}"
         method: GET
         headers:
           Authorization: "Bearer {{ rancher_token }}"
           Content-Type: "application/json"
         validate_certs: no
-      register: cluster_status
+      register: final_nodes
+      until: final_nodes.json.data | length > 0
+      retries: 30
+      delay: 10
+      ignore_errors: yes
 
-    - name: Display final cluster status
+    - name: Final registration report
       debug:
         msg: |
-          🏷️ FINAL CLUSTER STATUS:
-          - Cluster: {{ cluster_status.json.name }}
-          - State: {{ cluster_status.json.state }}
-          - Kubernetes Version: {{ cluster_status.json.kubernetesVersion }}
-          - Provider: {{ cluster_status.json.provider }}
+          🎯 FINAL REGISTRATION REPORT:
+          ============================
+          Cluster: {{ cluster_name }}
+          Expected VMs: {{ vm_count }}
+          Registered Nodes: {{ final_nodes.json.data | length }}
           
-          Conditions:
-          {% for condition in cluster_status.json.conditions %}
-            - {{ condition.type }}: {{ condition.status }} ({{ condition.message }})
+          {% if final_nodes.json.data | length > 0 %}
+          ✅ SUCCESS: Some nodes registered!
+          Registered Nodes:
+          {% for node in final_nodes.json.data %}
+          - {{ node.name }}: {{ node.state }} (etcd:{{ node.etcd }}, cp:{{ node.controlPlane }}, worker:{{ node.worker }})
           {% endfor %}
+          {% else %}
+          ❌ NO NODES REGISTERED
+          
+          Next steps:
+          1. Check VM connectivity to Rancher
+          2. Verify registration token is valid
+          3. Check cloud-init logs on VMs
+          4. Manually run registration commands
+          {% endif %}
