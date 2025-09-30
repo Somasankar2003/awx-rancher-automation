@@ -1,37 +1,13 @@
-- name: Create True Custom Cluster (Manual Kubernetes Installation)
+---
+- name: Create Rancher cluster via API
   hosts: localhost
   gather_facts: false
-
   vars:
     rancher_url: "https://192.168.170.67"
     api_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
-    cluster_name: "custom-cluster"
-    kubernetes_version: "v1.33.4+rke2r1"
 
   tasks:
-    - name: Display survey inputs
-      debug:
-        msg:
-          - "Creating TRUE custom cluster: {{ cluster_name }}"
-          - "Node Count: {{ node_count }}"
-          - "Node Roles: {{ node_roles }}"
-
-    - name: Fix node_roles format
-      set_fact:
-        actual_node_roles: "{{ (node_roles | first).split(',') if node_roles is iterable and node_roles | first is string and ',' in node_roles | first else node_roles }}"
-
-    - name: Validate configuration
-      assert:
-        that:
-          - node_count | int >= 1
-          - node_count | int <= 20
-          - ("etcd" in actual_node_roles and node_count | int >= 3) or "etcd" not in actual_node_roles
-        fail_msg: |
-          Invalid configuration:
-          - Need minimum 3 nodes if etcd role is selected
-        success_msg: "Configuration validated"
-
-    - name: Create custom cluster with explicit driver
+    - name: Create OpenStack cluster in Rancher
       uri:
         url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters"
         method: POST
@@ -40,119 +16,17 @@
           Content-Type: "application/json"
         body_format: json
         body:
-          apiVersion: provisioning.cattle.io/v1
-          kind: Cluster
           metadata:
-            name: "{{ cluster_name }}"
-            namespace: fleet-default
+            name: "custom-cluster"
+            namespace: "fleet-default"
           spec:
-            kubernetesVersion: "{{ kubernetes_version }}"
-            rkeConfig: {}
+            kubernetesVersion: "v1.33.4+rke2r1"
+            rkeConfig:
+              machinePools: []
         validate_certs: false
         status_code: 201
       register: create_cluster_response
 
-    - name: Debug cluster creation response
+    - name: Show response from Rancher API
       debug:
         var: create_cluster_response.json
-
-    - name: Wait for cluster to be created (check if it exists)
-      uri:
-        url: "{{ rancher_url }}/v1/provisioning.cattle.io.clusters/fleet-default/{{ cluster_name }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-        validate_certs: false
-        status_code: 200
-      register: cluster_status
-      until: cluster_status.status == 200
-      retries: 30
-      delay: 5
-
-    - name: Debug cluster status response
-      debug:
-        var: cluster_status.json
-
-    - name: Get cluster ID from v3 API
-      uri:
-        url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-        validate_certs: false
-        status_code: 200
-      register: v3_cluster_info
-
-    - name: Debug v3 cluster info
-      debug:
-        var: v3_cluster_info.json
-
-    - name: Extract cluster ID
-      set_fact:
-        cluster_id: "{{ v3_cluster_info.json.data[0].id }}"
-      when: 
-        - v3_cluster_info.json.data is defined
-        - v3_cluster_info.json.data | length > 0
-
-    - name: Create cluster registration token
-      uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          clusterId: "{{ cluster_id | default(cluster_name) }}"
-        validate_certs: false
-        status_code: 201
-      register: token_response
-
-    - name: Wait for token to be ready
-      uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens/{{ token_response.json.id }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ api_token }}"
-        validate_certs: false
-        status_code: 200
-      register: final_token
-      until: final_token.json.nodeCommand is defined
-      retries: 10
-      delay: 3
-
-    - name: Display MANUAL INSTALLATION instructions
-      debug:
-        msg:
-          - "✅ CUSTOM CLUSTER FRAMEWORK CREATED SUCCESSFULLY!"
-          - "Cluster Name: {{ cluster_name }}"
-          - "Cluster ID: {{ cluster_id | default('Unknown') }}"
-          - "Cluster Type: Manual Kubernetes Installation Required"
-          - ""
-          - "📋 REGISTRATION COMMAND:"
-          - "{{ final_token.json.nodeCommand }}"
-          - ""
-          - "🔧 MANUAL STEPS REQUIRED:"
-          - "1. Install Kubernetes (RKE2/K3s) manually on {{ node_count }} nodes"
-          - "2. Configure nodes with roles: {{ actual_node_roles }}"
-          - "3. Run the registration command on each node"
-          - "4. Wait for nodes to appear in Rancher UI"
-
-    - name: Save registration info
-      copy:
-        content: |
-          Custom Cluster Registration
-          ===========================
-          Cluster: {{ cluster_name }}
-          Nodes: {{ node_count }}
-          Roles: {{ actual_node_roles }}
-          
-          Registration Command:
-          {{ final_token.json.nodeCommand }}
-          
-          Instructions:
-          1. Manually install Kubernetes on nodes
-          2. Run the command above on each node
-          3. Configure appropriate roles
-        dest: "/tmp/{{ cluster_name }}-registration.txt"
-      delegate_to: localhost
