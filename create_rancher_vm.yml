@@ -6,8 +6,8 @@
 
   vars:
     # Rancher details
-    rancher_url: "https://192.168.170.67"
-    rancher_token: "token-kdlpz:c4pkgsl5pk5rm6rxtz5jr5frjhl9p427b76q2dm7pdnpsbnfwml9qf"
+    rancher_url: "https://k8smanager.comtegra.pl"
+    rancher_token: "token-p8htt:zmjjkpcfzb5gdrmq5djfsm4wrzszk9kb8fbqjpng9pvkmqm4fz762w"
     cluster_name: "{{ cluster_name }}"
 
     # Surveyed variables from AWX
@@ -17,17 +17,20 @@
     vm_flavor: "{{ vm_flavor }}"
 
     # Static VM details
-    vm_image: "7e19db1a-48d4-4418-b5e2-d2a5dc611a69"
-    vm_keypair: "rke"
+    vm_image: "4e04bf46-b48f-4bd2-a15a-efdd3a666d43"
+    vm_keypair: "k8s"
 
     # OpenStack authentication
-    os_auth_url: "http://192.168.150.31:5000/v3"
-    os_project_name: "XAS"
-    os_project_domain: "Default"
+    os_auth_url: "https://10.1.71.88:5000/v3"
+    os_project_name: "admin"
+    os_project_id: "e9f88faebaa44e3893fd26f9d41f9927"
+    os_project_domain_id: "9021632abac74b018ee13e95c5e81bea"
     os_username: "admin"
-    os_user_domain: "Default"
-    os_password: "2rlpcV3k3OPv"
+    os_user_domain_name: "admin_domain"
+    os_password: "Yaoki0kohghoQu9y"
     os_region_name: "RegionOne"
+    os_interface: "public"
+    os_identity_api_version: "3"
 
   tasks:
 
@@ -35,6 +38,12 @@
       fail:
         msg: "vm_count must be a positive integer. Got {{ vm_count }}."
       when: vm_count < 1
+
+    #- name: Ensure Rancher hostname is resolvable on control node
+     # lineinfile:
+      #  path: /etc/hosts
+       # line: "10.1.77.17 k8smanager.comtegra.pl"
+        #state: present
 
     - name: Convert comma-separated roles string into a list
       set_fact:
@@ -139,12 +148,20 @@
           packages:
             - curl
             - docker.io
+          write_files:
+            - path: /etc/hosts
+              permissions: '0644'
+              owner: root:root
+              append: true
+              content: |
+                10.1.77.17 k8smanager.comtegra.pl
           runcmd:
             - |
               echo "=== Starting Rancher Node Registration ==="
               echo "Node: rancher-node-{{ item.0 }}"
               echo "Role: {{ item.1 }}"
               echo "Cluster: {{ cluster_name }}"
+            - echo "10.1.77.17 k8smanager.comtegra.pl" >> /etc/hosts
             - systemctl enable docker
             - systemctl start docker
             - usermod -aG docker ubuntu
@@ -158,17 +175,11 @@
               BASE_CMD="{{ node_command }}"
               # Replace the curl command to add --insecure flag to curl, not the installer
               MODIFIED_CMD=$(echo "$BASE_CMD" | sed 's/curl /curl --insecure /g')
-              # Add specific roles
+              # Add specific roles based on node type
               FINAL_CMD="$MODIFIED_CMD"
-              {% if 'etcd' in item.1 %}
-              FINAL_CMD="$FINAL_CMD --etcd"
-              {% endif %}
-              {% if 'controlplane' in item.1 %}
-              FINAL_CMD="$FINAL_CMD --controlplane"
-              {% endif %}
-              {% if 'worker' in item.1 %}
-              FINAL_CMD="$FINAL_CMD --worker"
-              {% endif %}
+              {{ 'FINAL_CMD="$FINAL_CMD --etcd"' if 'etcd' in item.1 else '' }}
+              {{ 'FINAL_CMD="$FINAL_CMD --controlplane"' if 'controlplane' in item.1 else '' }}
+              {{ 'FINAL_CMD="$FINAL_CMD --worker"' if 'worker' in item.1 else '' }}
               FINAL_CMD="$FINAL_CMD --node-name rancher-node-{{ item.0 }}"
               echo "Final command: $FINAL_CMD"
               eval $FINAL_CMD
@@ -205,10 +216,10 @@
           
           # rancher-node-{{ vm.0 }} ({{ vm.1 }})
           # Replace 'curl ' with 'curl --insecure ' in the node command
-          {{ node_command | replace('curl ', 'curl --insecure ') }} \
-          {% if 'etcd' in vm.1 %}--etcd {% endif %}\
-          {% if 'controlplane' in vm.1 %}--controlplane {% endif %}\
-          {% if 'worker' in vm.1 %}--worker {% endif %}\
+          {{ node_command | replace('curl ', 'curl --insecure ') }}\
+          {% if 'etcd' in vm.1 %} --etcd{% endif %}\
+          {% if 'controlplane' in vm.1 %} --controlplane{% endif %}\
+          {% if 'worker' in vm.1 %} --worker{% endif %}\
           --node-name rancher-node-{{ vm.0 }}
           
           {% endfor %}
@@ -216,26 +227,29 @@
       delegate_to: localhost
 
     - name: Create VMs on OpenStack with cloud-init
-      os_server:
+      openstack.cloud.server:
         state: present
         name: "rancher-node-{{ item.0 }}"
         image: "{{ vm_image }}"
         flavor: "{{ vm_flavor }}"
         key_name: "{{ vm_keypair }}"
-        nics:
-          - net-id: "{{ vm_net }}"
+        network: "{{ vm_net }}"
         userdata: "{{ lookup('file', '/tmp/cloud-init-rancher-node-' + item.0|string + '.yml') }}"
         auto_ip: yes
         timeout: 600
-        cloud:
-          auth:
-            auth_url: "{{ os_auth_url }}"
-            project_name: "{{ os_project_name }}"
-            project_domain_name: "{{ os_project_domain }}"
-            username: "{{ os_username }}"
-            user_domain_name: "{{ os_user_domain }}"
-            password: "{{ os_password }}"
-          region_name: "{{ os_region_name }}"
+        wait: yes
+        validate_certs: false
+      environment:
+        OS_AUTH_URL: "{{ os_auth_url }}"
+        OS_PROJECT_NAME: "{{ os_project_name }}"
+        OS_PROJECT_ID: "{{ os_project_id }}"
+        OS_PROJECT_DOMAIN_ID: "{{ os_project_domain_id }}"
+        OS_USERNAME: "{{ os_username }}"
+        OS_USER_DOMAIN_NAME: "{{ os_user_domain_name }}"
+        OS_PASSWORD: "{{ os_password }}"
+        OS_REGION_NAME: "{{ os_region_name }}"
+        OS_INTERFACE: "{{ os_interface }}"
+        OS_IDENTITY_API_VERSION: "{{ os_identity_api_version }}"
       register: new_vms
       loop: "{{ vm_role_map }}"
       loop_control:
@@ -248,4 +262,10 @@
       loop_control:
         label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
 
-    # ... rest of your tasks remain the same
+    - name: Clean up temporary cloud-init files
+      file:
+        path: "/tmp/cloud-init-rancher-node-{{ item.0 }}.yml"
+        state: absent
+      loop: "{{ vm_role_map }}"
+      loop_control:
+        label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
