@@ -21,10 +21,9 @@
     vm_image: "494c4e8c-d11b-43b7-9e8b-df4009b7102b"
     vm_keypair: "k8s"
 
-    # OpenStack authentication (FIXED – matches RC)
+    # OpenStack authentication (RC FILE COMPATIBLE)
     os_auth_url: "http://192.168.170.50:5000"
     os_project_name: "Production Engineering"
-    os_project_id: "74b44d9c494348d095f0f6e92a74e229"
     os_project_domain_id: "default"
     os_username: "admin"
     os_user_domain_name: "Default"
@@ -43,7 +42,6 @@
         msg: "vm_count must be positive"
       when: vm_count < 1
 
-    # ===== ROLE FIX (ONLY THIS LOGIC CHANGED) =====
     - name: Normalize node roles
       set_fact:
         parsed_roles: >-
@@ -94,19 +92,6 @@
       set_fact:
         cluster_id: "{{ cluster_info.json.data[0].id }}"
 
-    - debug:
-        msg: "Cluster ID: {{ cluster_id }}"
-
-    - name: Check for existing registration tokens
-      uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ rancher_token }}"
-        validate_certs: no
-      register: existing_tokens
-
-    # ===== TOKEN FIX (FALSE FAILURE FIXED) =====
     - name: Get or create Rancher registration token
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
@@ -128,12 +113,11 @@
           Authorization: "Bearer {{ rancher_token }}"
         validate_certs: no
       register: reg_info
-      until: reg_info.json.data[0].nodeCommand is defined and reg_info.json.data[0].nodeCommand != ""
+      until: reg_info.json.data[0].nodeCommand is defined
       retries: 20
       delay: 5
 
-    - name: Store node command
-      set_fact:
+    - set_fact:
         node_command: "{{ reg_info.json.data[0].nodeCommand }}"
 
     ###########################################################################
@@ -173,7 +157,7 @@
       loop: "{{ vm_role_map }}"
 
     ###########################################################################
-    # CREATE VMS
+    # CREATE VMS (401 FIX APPLIED HERE)
     ###########################################################################
     - name: Create VM on OpenStack
       openstack.cloud.server:
@@ -190,7 +174,6 @@
       environment:
         OS_AUTH_URL: "{{ os_auth_url }}"
         OS_PROJECT_NAME: "{{ os_project_name }}"
-        OS_PROJECT_ID: "{{ os_project_id }}"
         OS_PROJECT_DOMAIN_ID: "{{ os_project_domain_id }}"
         OS_USERNAME: "{{ os_username }}"
         OS_USER_DOMAIN_NAME: "{{ os_user_domain_name }}"
@@ -199,7 +182,7 @@
         OS_INTERFACE: "{{ os_interface }}"
         OS_IDENTITY_API_VERSION: "{{ os_identity_api_version }}"
       loop: "{{ vm_role_map }}"
-      ignore_errors: yes
+      register: new_vms
 
     ###########################################################################
     # CLEANUP
@@ -213,5 +196,6 @@
     - name: Final success message
       debug:
         msg: |
-          🎉 SUCCESS! Cluster {{ cluster_name }} is now fully operational.
+          🎉 SUCCESS!
+          Cluster {{ cluster_name }} will become ACTIVE once nodes finish joining.
           Created VMs: {{ vm_names_list | join(', ') }}
