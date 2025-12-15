@@ -3,7 +3,7 @@
   hosts: localhost
   gather_facts: false
   vars:
-    rancher_url: "https://192.168.210.32/"
+    rancher_url: "https://192.168.210.32"
     api_token: "token-kt4rg:zppllkvsr7xl5cndlb4n4njqbckzjsmkd557xbgmh69bzdc7kqrkbl"
 
   tasks:
