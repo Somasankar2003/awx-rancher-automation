@@ -1,10 +1,1 @@
-#cloud-config
-package_update: true
-packages:
-  - curl
-  - jq
-runcmd:
-  - curl -fsSL https://get.docker.com | sh
-  - usermod -aG docker ubuntu
-  - echo "Running Rancher registration..."
-  -  curl --insecure -fL https://192.168.170.67/system-agent-install.sh | sudo  sh -s - --server https://192.168.170.67 --label 'cattle.io/os=linux' --token 5kz5vjdtfpzjdw54zdc9nkdmzlktrzzfgclbfs7cfp9zxtpmnc4gps --ca-checksum 6084395a78f897c01300c9fa486331eb81316b8271d7c45c64323eab518b51c0 --etcd --controlplane --worker
+
