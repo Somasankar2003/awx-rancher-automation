@@ -9,7 +9,7 @@
     # RANCHER
     ############################
     rancher_url: "https://192.168.210.32"
-    rancher_token: "token-REPLACE_ME"
+    rancher_token: "token-kt4rg:zppllkvsr7xl5cndlb4n4njqbckzjsmkd557xbgmh69bzdc7kqrkbl"
     cluster_name: "{{ cluster_name }}"
 
     ############################
@@ -35,7 +35,7 @@
     os_project_domain_id: "default"
     os_user_domain_name: "Default"
     os_username: "admin"
-    os_password: "stackmax"
+    os_password: "bLEZFvatBShkvUZyKrasUjmNdTTc9c3HcxWykrro"
     os_region_name: "RegionOne"
     os_interface: "public"
     os_identity_api_version: "3"
