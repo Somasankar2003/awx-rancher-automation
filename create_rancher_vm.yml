@@ -6,25 +6,26 @@
 
   vars:
     # Rancher details
-    rancher_url: "https://k8smanager.comtegra.pl"
-    rancher_token: "token-p8htt:zmjjkpcfzb5gdrmq5djfsm4wrzszk9kb8fbqjpng9pvkmqm4fz762w"
+    rancher_url: "https://192.168.210.32/"
+    rancher_token: "token-kt4rg:zppllkvsr7xl5cndlb4n4njqbckzjsmkd557xbgmh69bzdc7kqrkbl"
     cluster_name: "{{ cluster_name }}"
 
-    # Surveyed variables from AWX
+    # Survey variables from AWX
     vm_count: "{{ vm_count | int }}"
     node_roles: "{{ node_roles }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
+    vm_names_list: "{{ vm_name_prefix.split(',') }}"   # <<< REPLACEMENT
 
     # Static VM details
     vm_image: "4e04bf46-b48f-4bd2-a15a-efdd3a666d43"
     vm_keypair: "k8s"
 
     # OpenStack authentication
-    os_auth_url: "https://10.1.71.88:5000/v3"
-    os_project_name: "admin"
-    os_project_id: "e9f88faebaa44e3893fd26f9d41f9927"
-    os_project_domain_id: "9021632abac74b018ee13e95c5e81bea"
+    os_auth_url: "http://192.168.170.50:5000"
+    os_project_name: "Production Engineering"
+    os_project_id: "74b44d9c494348d095f0f6e92a74e229"
+    os_project_domain_id: "default"
     os_username: "admin"
     os_user_domain_name: "admin_domain"
     os_password: "Yaoki0kohghoQu9y"
@@ -34,210 +35,174 @@
 
   tasks:
 
-    - name: Validate vm_count is a positive integer
+    ###########################################################################
+    # VALIDATION
+    ###########################################################################
+    - name: Validate vm_count
       fail:
-        msg: "vm_count must be a positive integer. Got {{ vm_count }}."
+        msg: "vm_count must be positive"
       when: vm_count < 1
 
-    #- name: Ensure Rancher hostname is resolvable on control node
-     # lineinfile:
-      #  path: /etc/hosts
-       # line: "10.1.77.17 k8smanager.comtegra.pl"
-        #state: present
-
-    - name: Convert comma-separated roles string into a list
+    - name: Convert comma-separated roles into list
       set_fact:
         parsed_roles: "{{ node_roles.split(',') }}"
 
-    - name: Validate node_roles length matches vm_count
+    - name: Ensure role count matches VM count
       assert:
         that:
           - parsed_roles | length == vm_count
-        fail_msg: "node_roles must contain exactly {{ vm_count }} comma-separated roles. Got: {{ parsed_roles | length }}"
+        fail_msg: "Number of roles does not match number of VMs!"
 
-    - name: Generate VM list
+    - name: Ensure VM names count matches vm_count
+      assert:
+        that:
+          - vm_names_list | length == vm_count
+        fail_msg: "VM name count does not match vm_count!"
+
+    - name: Build VM → role map
       set_fact:
-        vm_list: "{{ query('sequence', 'start=1 end=' + vm_count|string) }}"
+        vm_role_map: "{{ vm_names_list | zip(parsed_roles) | list }}"
 
-    - name: Combine VM index and role
-      set_fact:
-        vm_role_map: "{{ vm_list | zip(parsed_roles) | list }}"
-
-    - name: Display VM-to-Role assignment
-      debug:
-        msg: "VM rancher-node-{{ item.0 }} will be assigned role(s): {{ item.1 }}"
+    - debug:
+        msg: "VM {{ item.0 }} will be {{ item.1 }}"
       loop: "{{ vm_role_map }}"
 
-    - name: Get cluster ID from Rancher
+    ###########################################################################
+    # RANCHER API CALLS
+    ###########################################################################
+    - name: Get Rancher cluster info
       uri:
         url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
         method: GET
         headers:
           Authorization: "Bearer {{ rancher_token }}"
-          Content-Type: "application/json"
         validate_certs: no
       register: cluster_info
 
-    - name: Debug cluster info
-      debug:
-        var: cluster_info.json
-
     - name: Fail if cluster not found
       fail:
-        msg: "Cluster '{{ cluster_name }}' not found in Rancher!"
+        msg: "Cluster {{ cluster_name }} not found in Rancher!"
       when: cluster_info.json.data | length == 0
 
-    - name: Extract cluster ID
+    - name: Set Rancher cluster ID
       set_fact:
         cluster_id: "{{ cluster_info.json.data[0].id }}"
 
-    - name: Create cluster registration token
-      uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ rancher_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          clusterId: "{{ cluster_id }}"
-        validate_certs: no
-        status_code: 201
-      register: token_create
-      ignore_errors: yes
+    - debug:
+        msg: "Cluster ID: {{ cluster_id }}"
 
-    - name: Wait for registration token to be ready
+    - name: Check for existing registration tokens
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
         method: GET
         headers:
           Authorization: "Bearer {{ rancher_token }}"
-          Content-Type: "application/json"
+        validate_certs: no
+      register: existing_tokens
+
+    - name: Create Rancher registration token if needed
+      uri:
+        url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+        body_format: json
+        body:
+          clusterId: "{{ cluster_id }}"
+        status_code: 201,200
+      register: token_create
+      when: existing_tokens.json.data | length == 0
+      ignore_errors: yes
+
+    - name: Wait for nodeCommand to be ready
+      uri:
+        url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
         validate_certs: no
       register: reg_info
-      until: >
-        reg_info.json.data[0].nodeCommand is defined and 
-        reg_info.json.data[0].nodeCommand != ""
+      until: reg_info.json.data[0].nodeCommand is defined and reg_info.json.data[0].nodeCommand != ""
       retries: 20
       delay: 5
 
-    - name: Debug registration token details
-      debug:
-        msg: |
-          🔍 REGISTRATION TOKEN DETAILS:
-          - Cluster: {{ cluster_name }}
-          - Cluster ID: {{ cluster_id }}
-          - Token: {{ reg_info.json.data[0].token }}
-          - Node Command Available: {{ reg_info.json.data[0].nodeCommand is defined }}
-
-    - name: Extract node command and token
+    - name: Store node command and token
       set_fact:
         node_command: "{{ reg_info.json.data[0].nodeCommand }}"
         registration_token: "{{ reg_info.json.data[0].token }}"
 
-    - name: Debug the actual node command
-      debug:
-        msg: "📝 NODE COMMAND: {{ node_command }}"
+    - debug:
+        msg: "Node command obtained successfully (token: {{ registration_token[:10] }}...)"
 
-    - name: Create cloud-init files with PROPER INSECURE handling
+    ###########################################################################
+    # CLOUD-INIT GENERATION
+    ###########################################################################
+
+    - name: Create cloud-init files
       copy:
-        dest: "/tmp/cloud-init-rancher-node-{{ item.0 }}.yml"
+        dest: "/tmp/cloud-init-{{ item.0 }}.yml"     # <<< REPLACED
         content: |
           #cloud-config
           package_update: true
           packages:
             - curl
             - docker.io
+            - jq
+            - iptables
+            - conntrack
+            - nfs-common
+            - apparmor-utils
+
           write_files:
             - path: /etc/hosts
-              permissions: '0644'
-              owner: root:root
-              append: true
               content: |
                 10.1.77.17 k8smanager.comtegra.pl
+              owner: root:root
+              permissions: '0644'
+
           runcmd:
-            - |
-              echo "=== Starting Rancher Node Registration ==="
-              echo "Node: rancher-node-{{ item.0 }}"
-              echo "Role: {{ item.1 }}"
-              echo "Cluster: {{ cluster_name }}"
-            - echo "10.1.77.17 k8smanager.comtegra.pl" >> /etc/hosts
+            - echo "=== Starting Node Registration for {{ item.0 }} as {{ item.1 }} ==="
             - systemctl enable docker
             - systemctl start docker
             - usermod -aG docker ubuntu
             - sleep 10
+
             - |
-              echo "=== Testing Rancher connectivity ==="
-              curl -k -I {{ rancher_url }} && echo "✅ Rancher is reachable" || echo "❌ Cannot reach Rancher"
-            - |
-              echo "=== Installing Rancher System Agent with PROPER INSECURE handling ==="
-              # Extract the base command and modify it to use --insecure properly
-              BASE_CMD="{{ node_command }}"
-              # Replace the curl command to add --insecure flag to curl, not the installer
-              MODIFIED_CMD=$(echo "$BASE_CMD" | sed 's/curl /curl --insecure /g')
-              # Add specific roles based on node type
-              FINAL_CMD="$MODIFIED_CMD"
-              {{ 'FINAL_CMD="$FINAL_CMD --etcd"' if 'etcd' in item.1 else '' }}
-              {{ 'FINAL_CMD="$FINAL_CMD --controlplane"' if 'controlplane' in item.1 else '' }}
-              {{ 'FINAL_CMD="$FINAL_CMD --worker"' if 'worker' in item.1 else '' }}
-              FINAL_CMD="$FINAL_CMD --node-name rancher-node-{{ item.0 }}"
-              echo "Final command: $FINAL_CMD"
-              eval $FINAL_CMD
-            - |
-              echo "=== Registration Command Executed ==="
-              echo "Waiting for agent to start..."
-              sleep 30
-            - |
-              echo "=== Checking Rancher System Agent Status ==="
-              systemctl status rancher-system-agent --no-pager || echo "Agent service not found yet"
-            - |
-              echo "=== Checking Docker Containers ==="
-              docker ps -a || echo "Docker check failed"
-            - |
-              echo "=== Checking system logs ==="
-              journalctl -u rancher-system-agent --no-pager -n 20 || echo "No rancher agent logs yet"
-            - |
-              echo "=== Registration Process Complete ==="
+              BASE="{{ node_command }}"
+              BASE=$(echo "$BASE" | sed 's/curl /curl -k /g')
+              FINAL="$BASE"
+
+              {% if 'etcd' in item.1 %}FINAL="$FINAL --etcd"{% endif %}
+              {% if 'controlplane' in item.1 %}FINAL="$FINAL --controlplane"{% endif %}
+              {% if 'worker' in item.1 %}FINAL="$FINAL --worker"{% endif %}
+
+              FINAL="$FINAL --node-name {{ item.0 }}"       # <<< REPLACED
+
+              echo "$FINAL" > /tmp/rancher_join.sh
+              chmod +x /tmp/rancher_join.sh
+              /tmp/rancher_join.sh
+
+            - echo "=== Node registration completed ==="
+            - docker ps
       loop: "{{ vm_role_map }}"
-      loop_control:
-        label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
 
-    - name: Save registration commands for manual testing
-      copy:
-        content: |
-          MANUAL REGISTRATION COMMANDS (WITH PROPER INSECURE)
-          ===================================================
-          Cluster: {{ cluster_name }}
-          Cluster ID: {{ cluster_id }}
-          Token: {{ registration_token }}
-          
-          Manual Test Commands (run on VMs):
-          {% for vm in vm_role_map %}
-          
-          # rancher-node-{{ vm.0 }} ({{ vm.1 }})
-          # Replace 'curl ' with 'curl --insecure ' in the node command
-          {{ node_command | replace('curl ', 'curl --insecure ') }}\
-          {% if 'etcd' in vm.1 %} --etcd{% endif %}\
-          {% if 'controlplane' in vm.1 %} --controlplane{% endif %}\
-          {% if 'worker' in vm.1 %} --worker{% endif %}\
-          --node-name rancher-node-{{ vm.0 }}
-          
-          {% endfor %}
-        dest: "/tmp/{{ cluster_name }}-manual-commands.txt"
-      delegate_to: localhost
+    ###########################################################################
+    # CREATE VMS
+    ###########################################################################
 
-    - name: Create VMs on OpenStack with cloud-init
+    - name: Create VM on OpenStack
       openstack.cloud.server:
         state: present
-        name: "rancher-node-{{ item.0 }}"
+        name: "{{ item.0 }}"              # <<< REPLACED
         image: "{{ vm_image }}"
         flavor: "{{ vm_flavor }}"
         key_name: "{{ vm_keypair }}"
         network: "{{ vm_net }}"
-        userdata: "{{ lookup('file', '/tmp/cloud-init-rancher-node-' + item.0|string + '.yml') }}"
+        userdata: "{{ lookup('file', '/tmp/cloud-init-' + item.0 + '.yml') }}"
         auto_ip: yes
-        timeout: 600
         wait: yes
+        timeout: 600
         validate_certs: false
       environment:
         OS_AUTH_URL: "{{ os_auth_url }}"
@@ -252,20 +217,89 @@
         OS_IDENTITY_API_VERSION: "{{ os_identity_api_version }}"
       register: new_vms
       loop: "{{ vm_role_map }}"
-      loop_control:
-        label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
+      ignore_errors: yes
 
-    - name: Show created VM details with IPs
+    ###########################################################################
+    # DISPLAY VM INFO
+    ###########################################################################
+    - name: Display VM information
       debug:
-        msg: "✅ VM rancher-node-{{ item.0 }} (role: {{ item.1 }}) - IP: {{ new_vms.results[item.0 | int - 1].server.public_v4 | default(new_vms.results[item.0 | int - 1].server.private_v4) | default('No IP') }}"
-      loop: "{{ vm_role_map }}"
-      loop_control:
-        label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
+        msg: |
+          VM {{ item.0 }} created
+          Status: {{ new_vms.results[loop.index0].server.status | default('Unknown') }}
+          ID: {{ new_vms.results[loop.index0].server.id | default('Unknown') }}
 
-    - name: Clean up temporary cloud-init files
+          {% if new_vms.results[loop.index0].server.addresses is defined %}
+          Networks:
+          {% for network_name, addresses in new_vms.results[loop.index0].server.addresses.items() %}
+            - {{ network_name }}:
+            {% for addr in addresses %}
+              - {{ addr.addr }} ({{ addr.version }})
+            {% endfor %}
+          {% endfor %}
+          {% else %}
+          IP: Not assigned yet
+          {% endif %}
+      loop: "{{ vm_role_map }}"
+      when: new_vms is defined
+
+    ###########################################################################
+    # WAIT FOR CLUSTER ACTIVATION
+    ###########################################################################
+    - name: Wait for nodes to register in Rancher
+      uri:
+        url: "{{ rancher_url }}/v3/nodes?clusterId={{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+      register: rancher_nodes
+      until: rancher_nodes.json.data | length >= vm_count
+      retries: 500
+      delay: 10
+      ignore_errors: yes
+
+    - debug:
+        msg: "Found {{ rancher_nodes.json.data | length }} nodes in Rancher"
+
+    - name: Wait for cluster to become active
+      uri:
+        url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+      register: cluster_state
+      until:
+        - cluster_state.json.state == "active"
+        - cluster_state.json.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first == "True"
+      retries: 600
+      delay: 10
+
+    - name: Show final cluster status
+      debug:
+        msg: |
+          ✅ CLUSTER ACTIVE!
+          Cluster: {{ cluster_name }}
+          State: {{ cluster_state.json.state }}
+          Kubernetes Version: {{ cluster_state.json.version.gitVersion | default('N/A') }}
+          Node Count: {{ cluster_state.json.appliedSpec.rancherKubernetesEngineConfig.nodes | length | default(0) }}
+
+          {% for condition in cluster_state.json.conditions %}
+            - {{ condition.type }}: {{ condition.status }}
+          {% endfor %}
+
+    ###########################################################################
+    # CLEANUP
+    ###########################################################################
+    - name: Remove cloud-init temp files
       file:
-        path: "/tmp/cloud-init-rancher-node-{{ item.0 }}.yml"
+        path: "/tmp/cloud-init-{{ item.0 }}.yml"
         state: absent
       loop: "{{ vm_role_map }}"
-      loop_control:
-        label: "rancher-node-{{ item.0 }} - {{ item.1 }}"
+
+    - name: Final success message
+      debug:
+        msg: |
+          🎉 SUCCESS! Cluster {{ cluster_name }} is now fully operational.
+          Created VMs: {{ vm_names_list | join(', ') }}
