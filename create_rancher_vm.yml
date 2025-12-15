@@ -40,6 +40,7 @@
     os_project_domain_id: "default"
     os_username: "admin"
     os_user_domain_name: "Default"
+    os_project_id: "74b44d9c494348d095f0f6e92a74e229"
     os_password: "bLEZFvatBShkvUZyKrasUjmNdTTc9c3HcxWykrro"
     os_region_name: "RegionOne"
     os_interface: "public"
