@@ -3,11 +3,11 @@
   hosts: localhost
   gather_facts: false
   vars:
-    rancher_url: "https://k8smanager.comtegra.pl"
-    api_token: "token-p8htt:zmjjkpcfzb5gdrmq5djfsm4wrzszk9kb8fbqjpng9pvkmqm4fz762w"
+    rancher_url: "https://192.168.210.32/"
+    api_token: "token-kt4rg:zppllkvsr7xl5cndlb4n4njqbckzjsmkd557xbgmh69bzdc7kqrkbl"
     cluster_name: "{{ cluster_name }}"
     # Hardcode only the correct checksum
-    correct_checksum: "3d1a4c798bf0a64a3ae60ebacbac9c86a4e9e481b00e6e6ee0381b747cff5466"
+    correct_checksum: "314fb475a79f038ea12ebc2be48956716027ceebf9dd5ea11d7dce85bb2b20c7"
 
   tasks:
     - name: Fetch cluster details
