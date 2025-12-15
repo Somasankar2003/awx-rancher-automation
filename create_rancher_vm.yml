@@ -34,24 +34,61 @@
 
   tasks:
     ###########################################################################
-    # VALIDATION
+    # SMART ROLE HANDLING
     ###########################################################################
-    - name: Validate inputs
-      assert:
-        that:
-          - vm_count >= 1
-          - vm_names_list | length == vm_count
-          - node_roles.split(',') | length == vm_count
-        fail_msg: |
-          Validation failed:
-          - vm_count must be >= 1
-          - VM names count must match vm_count
-          - Role count must match vm_count
-
-    - name: Build VM role mapping
+    - name: Determine role assignment mode
       set_fact:
-        parsed_roles: "{{ node_roles.split(',') }}"
-        vm_role_map: "{{ vm_names_list | zip(parsed_roles) | list }}"
+        # Single VM with multiple roles
+        single_vm_multiple_roles: "{{ vm_count == 1 and ',' in node_roles }}"
+        # Multiple VMs with single roles each
+        multi_vm_single_roles: "{{ vm_count > 1 and node_roles.split(',') | length == vm_count }}"
+        # Multiple VMs with multiple roles (uncommon but handled)
+        multi_vm_multi_roles: "{{ vm_count > 1 and node_roles.split(',') | length != vm_count }}"
+
+    - name: Validate configuration
+      block:
+        - name: Check basic requirements
+          assert:
+            that:
+              - vm_count >= 1
+              - vm_names_list | length == vm_count
+            fail_msg: |
+              Validation failed:
+              - vm_count must be >= 1 (got {{ vm_count }})
+              - VM names count ({{ vm_names_list | length }}) must match vm_count ({{ vm_count }})
+        
+        - name: Check role configuration
+          assert:
+            that:
+              - single_vm_multiple_roles or multi_vm_single_roles or multi_vm_multi_roles
+            fail_msg: |
+              Role configuration error:
+              For 1 VM: Use comma-separated roles (e.g., "etcd,controlplane,worker")
+              For multiple VMs: Use comma-separated roles matching VM count (e.g., "etcd,controlplane,worker" for 3 VMs)
+              Current: vm_count={{ vm_count }}, roles={{ node_roles }}
+
+    - name: Build VM role mapping based on mode
+      block:
+        - name: Single VM with multiple roles
+          set_fact:
+            vm_role_map: "{{ [ (vm_names_list[0], node_roles) ] }}"
+          when: single_vm_multiple_roles
+        
+        - name: Multiple VMs with single roles
+          set_fact:
+            parsed_roles: "{{ node_roles.split(',') }}"
+            vm_role_map: "{{ vm_names_list | zip(parsed_roles) | list }}"
+          when: multi_vm_single_roles
+        
+        - name: Multiple VMs with multiple roles (all get same roles)
+          set_fact:
+            vm_role_map: "{{ vm_names_list | map('regex_replace', '$', ' ' + node_roles) | list | map('split') | map('list') }}"
+          when: multi_vm_multi_roles
+
+    - name: Display VM-Role mapping
+      debug:
+        msg: "VM '{{ item.0 }}' → Roles: {{ item.1 }}"
+      loop: "{{ vm_role_map }}"
 
     ###########################################################################
     # GET RANCHER CLUSTER INFO
@@ -76,20 +113,8 @@
     - debug:
         msg: "Found cluster '{{ cluster_name }}' with ID: {{ cluster_id }}"
 
-    - name: Check cluster current state
-      uri:
-        url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ rancher_token }}"
-        validate_certs: no
-      register: current_state
-      
-    - debug:
-        msg: "Current cluster state: {{ current_state.json.state }}"
-
     ###########################################################################
-    # GET RANCHER JOIN TOKEN (CRITICAL FIX)
+    # GET RANCHER JOIN TOKEN
     ###########################################################################
     - name: Check for existing registration tokens
       uri:
@@ -124,7 +149,6 @@
       until: 
         - reg_info.json.data[0].nodeCommand is defined
         - reg_info.json.data[0].nodeCommand != ""
-        - "'curl' in reg_info.json.data[0].nodeCommand"
       retries: 15
       delay: 3
 
@@ -190,7 +214,7 @@
             - |
               FINAL_CMD='{{ node_command }}'
               
-              # Add role flags
+              # Add role flags based on item.1 (which could be single or comma-separated roles)
               {% if 'etcd' in item.1 %}FINAL_CMD="$FINAL_CMD --etcd"{% endif %}
               {% if 'controlplane' in item.1 %}FINAL_CMD="$FINAL_CMD --controlplane"{% endif %}
               {% if 'worker' in item.1 %}FINAL_CMD="$FINAL_CMD --worker"{% endif %}
@@ -256,7 +280,7 @@
       loop: "{{ vm_names_list }}"
 
     ###########################################################################
-    # WAIT FOR NODES TO REGISTER (MISSING IN YOUR SCRIPT!)
+    # WAIT FOR NODES TO REGISTER
     ###########################################################################
     - name: Wait for nodes to appear in Rancher API
       uri:
@@ -328,4 +352,3 @@
           Cluster: {{ cluster_name }}
           State: {{ cluster_status.json.state }}
           VMs: {{ vm_names_list | join(', ') }}
-          Total time: ~{{ ((50*10) + (30*10) + (15*3)) // 60 }} minutes
