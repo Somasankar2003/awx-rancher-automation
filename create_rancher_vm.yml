@@ -1,27 +1,23 @@
 ---
-- name: Create multiple VMs on OpenStack and auto-register to Rancher
+- name: Create multiple VMs on OpenStack and auto-register to Rancher (RKE2)
   hosts: localhost
   connection: local
   gather_facts: no
 
   vars:
-    # Rancher details
     rancher_url: "https://192.168.210.32"
     rancher_token: "token-kt4rg:zppllkvsr7xl5cndlb4n4njqbckzjsmkd557xbgmh69bzdc7kqrkbl"
     cluster_name: "{{ cluster_name }}"
 
-    # Survey variables from AWX
     vm_count: "{{ vm_count | int }}"
     node_roles: "{{ node_roles }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
     vm_names_list: "{{ vm_name_prefix.split(',') }}"
 
-    # Static VM details
     vm_image: "494c4e8c-d11b-43b7-9e8b-df4009b7102b"
     vm_keypair: "k8s"
 
-    # OpenStack authentication (RC FILE COMPATIBLE)
     os_auth_url: "http://192.168.170.50:5000"
     os_project_name: "Production Engineering"
     os_project_domain_id: "default"
@@ -35,15 +31,9 @@
   tasks:
 
     ###########################################################################
-    # VALIDATION
+    # ROLE NORMALIZATION
     ###########################################################################
-    - name: Validate vm_count
-      fail:
-        msg: "vm_count must be positive"
-      when: vm_count < 1
-
-    - name: Normalize node roles
-      set_fact:
+    - set_fact:
         parsed_roles: >-
           {{
             [node_roles]
@@ -51,30 +41,13 @@
             else (node_roles.split(',') | map('trim') | list)
           }}
 
-    - name: Ensure role count matches VM count
-      assert:
-        that:
-          - parsed_roles | length == vm_count
-        fail_msg: "Number of roles does not match number of VMs!"
-
-    - name: Ensure VM names count matches vm_count
-      assert:
-        that:
-          - vm_names_list | length == vm_count
-        fail_msg: "VM name count does not match vm_count!"
-
-    - name: Build VM → role map
-      set_fact:
+    - set_fact:
         vm_role_map: "{{ vm_names_list | zip(parsed_roles) | list }}"
 
-    - debug:
-        msg: "VM {{ item.0 }} will be {{ item.1 }}"
-      loop: "{{ vm_role_map }}"
-
     ###########################################################################
-    # RANCHER API CALLS
+    # RANCHER API
     ###########################################################################
-    - name: Get Rancher cluster info
+    - name: Get Rancher cluster
       uri:
         url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
         method: GET
@@ -83,16 +56,10 @@
         validate_certs: no
       register: cluster_info
 
-    - name: Fail if cluster not found
-      fail:
-        msg: "Cluster {{ cluster_name }} not found in Rancher!"
-      when: cluster_info.json.data | length == 0
-
-    - name: Set Rancher cluster ID
-      set_fact:
+    - set_fact:
         cluster_id: "{{ cluster_info.json.data[0].id }}"
 
-    - name: Get or create Rancher registration token
+    - name: Get registration token
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
         method: POST
@@ -102,10 +69,9 @@
         body_format: json
         body:
           clusterId: "{{ cluster_id }}"
-      register: token_create
       failed_when: false
 
-    - name: Wait for nodeCommand to be ready
+    - name: Fetch nodeCommand
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
         method: GET
@@ -121,7 +87,7 @@
         node_command: "{{ reg_info.json.data[0].nodeCommand }}"
 
     ###########################################################################
-    # CLOUD-INIT GENERATION
+    # CLOUD INIT — RKE2 JOIN
     ###########################################################################
     - name: Create cloud-init files
       copy:
@@ -131,33 +97,16 @@
           package_update: true
           packages:
             - curl
-            - docker.io
-            - jq
-            - iptables
-            - conntrack
-            - nfs-common
-            - apparmor-utils
 
           runcmd:
-            - systemctl enable docker
-            - systemctl start docker
-            - sleep 10
             - |
-              CMD="{{ node_command }}"
-              CMD=$(echo "$CMD" | sed 's/curl /curl -k /g')
+              echo "Installing RKE2..."
+              {{ node_command | replace('curl ', 'curl -k ') }}
 
-              {% if 'etcd' in item.1 %}CMD="$CMD --etcd"{% endif %}
-              {% if 'controlplane' in item.1 %}CMD="$CMD --controlplane"{% endif %}
-              {% if 'worker' in item.1 %}CMD="$CMD --worker"{% endif %}
-
-              CMD="$CMD --node-name {{ item.0 }}"
-              echo "$CMD" > /tmp/join.sh
-              chmod +x /tmp/join.sh
-              /tmp/join.sh
       loop: "{{ vm_role_map }}"
 
     ###########################################################################
-    # CREATE VMS (401 FIX APPLIED HERE)
+    # CREATE VM
     ###########################################################################
     - name: Create VM on OpenStack
       openstack.cloud.server:
@@ -168,9 +117,8 @@
         key_name: "{{ vm_keypair }}"
         network: "{{ vm_net }}"
         userdata: "{{ lookup('file', '/tmp/cloud-init-' + item.0 + '.yml') }}"
-        auto_ip: yes
-        wait: yes
-        timeout: 600
+        auto_ip: no
+        wait: no
       environment:
         OS_AUTH_URL: "{{ os_auth_url }}"
         OS_PROJECT_NAME: "{{ os_project_name }}"
@@ -182,20 +130,21 @@
         OS_INTERFACE: "{{ os_interface }}"
         OS_IDENTITY_API_VERSION: "{{ os_identity_api_version }}"
       loop: "{{ vm_role_map }}"
-      register: new_vms
 
     ###########################################################################
-    # CLEANUP
+    # WAIT FOR CLUSTER ACTIVE
     ###########################################################################
-    - name: Remove cloud-init temp files
-      file:
-        path: "/tmp/cloud-init-{{ item.0 }}.yml"
-        state: absent
-      loop: "{{ vm_role_map }}"
+    - name: Wait for cluster to become active
+      uri:
+        url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+      register: cluster_state
+      until: cluster_state.json.state == "active"
+      retries: 600
+      delay: 10
 
-    - name: Final success message
-      debug:
-        msg: |
-          🎉 SUCCESS!
-          Cluster {{ cluster_name }} will become ACTIVE once nodes finish joining.
-          Created VMs: {{ vm_names_list | join(', ') }}
+    - debug:
+        msg: "✅ Cluster {{ cluster_name }} is ACTIVE"
