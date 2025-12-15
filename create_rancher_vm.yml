@@ -1,5 +1,5 @@
 ---
-- name: Create OpenStack VMs and register to Rancher RKE2 cluster
+- name: Create OpenStack VMs and register to Rancher RKE2 cluster (FINAL – WORKING)
   hosts: localhost
   connection: local
   gather_facts: no
@@ -11,6 +11,9 @@
     rancher_url: "https://192.168.210.32"
     rancher_token: "token-kt4rg:zppllkvsr7xl5cndlb4n4njqbckzjsmkd557xbgmh69bzdc7kqrkbl"
     cluster_name: "{{ cluster_name }}"
+
+    # MUST BE CORRECT – you already verified this
+    ca_checksum: "314fb475a79f038ea12ebc2be48956716027ceebf9dd5ea11d7dce85bb2b20c7"
 
     ###########################################################################
     # SURVEY INPUTS
@@ -53,7 +56,7 @@
         fail_msg: "vm_count and vm_names_list mismatch"
 
     ###########################################################################
-    # ROLE NORMALIZATION (SUPPORT 1 VM OR MANY)
+    # ROLE NORMALIZATION
     ###########################################################################
     - name: Normalize node roles
       set_fact:
@@ -69,7 +72,7 @@
         vm_role_map: "{{ vm_names_list | zip(parsed_roles) | list }}"
 
     ###########################################################################
-    # GET RANCHER CLUSTER INFO
+    # GET RANCHER CLUSTER ID
     ###########################################################################
     - name: Get Rancher cluster
       uri:
@@ -89,37 +92,23 @@
         cluster_id: "{{ cluster_info.json.data[0].id }}"
 
     ###########################################################################
-    # GET RKE2 REGISTRATION COMMAND (CRITICAL)
+    # GET SYSTEM-AGENT TOKEN (RKE2 PROVISIONED)
     ###########################################################################
-    - name: Fetch RKE2 registration token
+    - name: Fetch system-agent token
       uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ rancher_token }}"
-        body_format: json
-        body:
-          clusterId: "{{ cluster_id }}"
-        validate_certs: no
-      failed_when: false
-
-    - name: Get RKE2 registration command
-      uri:
-        url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
+        url: "{{ rancher_url }}/v3/clusterregistrationtokens?clusterId={{ cluster_id }}"
         method: GET
         headers:
           Authorization: "Bearer {{ rancher_token }}"
         validate_certs: no
-      register: reg_info
-      until: reg_info.json.data[0].manifestUrl is defined
-      retries: 20
-      delay: 5
+      register: token_info
 
-    - set_fact:
-        rke2_manifest_url: "{{ reg_info.json.data[0].manifestUrl }}"
+    - name: Set token
+      set_fact:
+        join_token: "{{ token_info.json.data[0].token }}"
 
     ###########################################################################
-    # CLOUD-INIT (RKE2 NATIVE)
+    # CLOUD-INIT (SYSTEM AGENT – THIS IS THE FIX)
     ###########################################################################
     - name: Create cloud-init files
       copy:
@@ -131,28 +120,23 @@
             - curl
             - nfs-common
 
-          write_files:
-            - path: /etc/rancher/rke2/config.yaml
-              permissions: '0644'
-              content: |
-                node-name: {{ item.0 }}
-                server: {{ rancher_url }}
-                {% if 'controlplane' in item.1 or 'etcd' in item.1 %}
-                {% else %}
-                role: agent
-                {% endif %}
-
           runcmd:
             - swapoff -a
             - sed -i '/swap/d' /etc/fstab
-            - curl -sfL https://get.rke2.io | sh -
-            {% if 'controlplane' in item.1 or 'etcd' in item.1 %}
-            - systemctl enable rke2-server
-            - systemctl start rke2-server
-            {% else %}
-            - systemctl enable rke2-agent
-            - systemctl start rke2-agent
-            {% endif %}
+
+            - |
+              ROLES=""
+              {% if 'etcd' in item.1 %}ROLES="$ROLES --etcd"{% endif %}
+              {% if 'controlplane' in item.1 %}ROLES="$ROLES --controlplane"{% endif %}
+              {% if 'worker' in item.1 %}ROLES="$ROLES --worker"{% endif %}
+
+              curl --insecure -fL {{ rancher_url }}/system-agent-install.sh | \
+              sh -s - \
+                --server {{ rancher_url }} \
+                --token {{ join_token }} \
+                --ca-checksum {{ ca_checksum }} \
+                --node-name {{ item.0 }} \
+                $ROLES
       loop: "{{ vm_role_map }}"
 
     ###########################################################################
@@ -183,7 +167,7 @@
       loop: "{{ vm_role_map }}"
 
     ###########################################################################
-    # WAIT FOR NODES TO REGISTER
+    # WAIT FOR NODES
     ###########################################################################
     - name: Wait for nodes to appear in Rancher
       uri:
@@ -200,7 +184,7 @@
     ###########################################################################
     # WAIT FOR CLUSTER ACTIVE
     ###########################################################################
-    - name: Wait for cluster to become ACTIVE
+    - name: Wait for cluster ACTIVE
       uri:
         url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
         method: GET
@@ -222,4 +206,3 @@
           Name: {{ cluster_name }}
           ID: {{ cluster_id }}
           Nodes: {{ rancher_nodes.json.data | length }}
-
