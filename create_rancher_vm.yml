@@ -1,5 +1,5 @@
 ---
-- name: Create OpenStack VMs and register to Rancher RKE2 cluster (FINAL FIX)
+- name: Create OpenStack VMs and register to Rancher RKE2 cluster (FINAL CORRECTED)
   hosts: localhost
   connection: local
   gather_facts: no
@@ -44,48 +44,98 @@
   tasks:
 
     ###########################################################################
-    # VM NAME GENERATION
+    # VALIDATION & SETUP
     ###########################################################################
-    - name: Generate VM names
+    - name: Validate Rancher URL is reachable
+      uri:
+        url: "{{ rancher_url }}/v3"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+        timeout: 30
+      register: rancher_check
+      ignore_errors: yes
+
+    - name: Fail if Rancher is not reachable
+      fail:
+        msg: |
+          Cannot connect to Rancher at {{ rancher_url }}
+          Status: {{ rancher_check.status | default('Unknown') }}
+          Error: {{ rancher_check.msg | default('Unknown error') }}
+      when: rancher_check.failed
+
+    - name: Parse VM names
       set_fact:
         vm_names_list: >-
           {% if ',' in vm_name_prefix %}
             {{ vm_name_prefix.split(',') }}
           {% else %}
-            {{ range(1, vm_count + 1)
-               | map('string')
-               | map('regex_replace', '^(.*)$', vm_name_prefix ~ '\\1')
-               | list }}
+            {% set base_name = vm_name_prefix %}
+            {% set names = [] %}
+            {% for i in range(1, vm_count + 1) %}
+              {% set _ = names.append(base_name + '-' + i|string) %}
+            {% endfor %}
+            {{ names }}
           {% endif %}
 
-    ###########################################################################
-    # ROLE NORMALIZATION (CRITICAL FIX)
-    ###########################################################################
-    - name: Normalize roles (support 1 VM or many)
-      set_fact:
-        parsed_roles: >-
-          {% if vm_count == 1 %}
-            [ "{{ node_roles }}" ]
-          {% else %}
-            {{ node_roles.split(',') | map('trim') | list }}
-          {% endif %}
-
-    - name: Debug parsed input
+    - name: Debug inputs
       debug:
         msg:
           - "VM Count: {{ vm_count }}"
-          - "VM Names: {{ vm_names_list }}"
-          - "Roles: {{ parsed_roles }}"
+          - "VM Names List: {{ vm_names_list }}"
+          - "Node Roles Input: {{ node_roles }}"
+          - "Type of node_roles: {{ node_roles | type_debug }}"
+
+    - name: Parse node roles based on input format
+      set_fact:
+        parsed_roles: >-
+          {% if node_roles is string %}
+            {% if vm_count == 1 %}
+              # Single VM with multiple roles (e.g., "etcd,controlplane,worker")
+              {{ [node_roles] }}
+            {% elif ',' in node_roles and ';' not in node_roles %}
+              # Multiple VMs with single role each (e.g., "etcd,controlplane,worker" for 3 VMs)
+              {{ node_roles.split(',')[:vm_count] }}
+            {% elif ';' in node_roles %}
+              # Multiple VMs with multiple roles separated by semicolons
+              {{ node_roles.split(';')[:vm_count] }}
+            {% else %}
+              # Single role for all VMs
+              {% set roles = [] %}
+              {% for i in range(vm_count) %}
+                {% set _ = roles.append(node_roles) %}
+              {% endfor %}
+              {{ roles }}
+            {% endif %}
+          {% else %}
+            # Already a list
+            {{ node_roles }}
+          {% endif %}
+
+    - name: Debug parsed roles
+      debug:
+        msg:
+          - "Parsed Roles: {{ parsed_roles }}"
+          - "Number of roles: {{ parsed_roles | length }}"
+          - "Expected: {{ vm_count }}"
 
     - name: Validate inputs
       assert:
         that:
+          - vm_count >= 1
           - vm_names_list | length == vm_count
           - parsed_roles | length == vm_count
-        fail_msg: "VM count, names, and roles mismatch"
+        fail_msg: |
+          Input validation failed:
+          - VM Count: {{ vm_count }}
+          - VM Names: {{ vm_names_list | length }} ({{ vm_names_list }})
+          - Roles: {{ parsed_roles | length }} ({{ parsed_roles }})
+          Check your input format. For multiple VMs with different roles, use semicolons:
+          Example: "etcd,controlplane;worker" for 2 VMs (first has etcd+controlplane, second has worker)
 
     ###########################################################################
-    # GET RANCHER CLUSTER
+    # GET RANCHER CLUSTER ID
     ###########################################################################
     - name: Get Rancher cluster
       uri:
@@ -98,16 +148,22 @@
 
     - name: Fail if cluster not found
       fail:
-        msg: "Cluster {{ cluster_name }} not found in Rancher"
+        msg: |
+          Cluster "{{ cluster_name }}" not found in Rancher.
+          Available clusters: {{ cluster_info.json.data | map(attribute='name') | list }}
       when: cluster_info.json.data | length == 0
 
     - set_fact:
         cluster_id: "{{ cluster_info.json.data[0].id }}"
 
+    - name: Debug cluster info
+      debug:
+        msg: "Found cluster '{{ cluster_name }}' with ID: {{ cluster_id }}"
+
     ###########################################################################
-    # GET SYSTEM AGENT TOKEN
+    # GET SYSTEM-AGENT TOKEN
     ###########################################################################
-    - name: Fetch registration token
+    - name: Fetch system-agent token
       uri:
         url: "{{ rancher_url }}/v3/clusterregistrationtokens?clusterId={{ cluster_id }}"
         method: GET
@@ -116,41 +172,63 @@
         validate_certs: no
       register: token_info
 
+    - name: Debug token info
+      debug:
+        msg: "Token API response: {{ token_info.json | to_nice_json }}"
+      when: token_info.json.data | length == 0
+
+    - name: Fail if no token found
+      fail:
+        msg: |
+          No cluster registration token found for cluster {{ cluster_name }}.
+          You need to create a registration token in Rancher first.
+      when: token_info.json.data | length == 0
+
     - set_fact:
         join_token: "{{ token_info.json.data[0].token }}"
 
+    - name: Debug join token
+      debug:
+        msg: "Join token: {{ join_token }}"
+
     ###########################################################################
-    # CREATE VMS WITH SYSTEM-AGENT (CORRECT WAY)
+    # CREATE VMS WITH CLOUD-INIT
     ###########################################################################
-    - name: Create OpenStack VMs
-      openstack.cloud.server:
-        state: present
-        name: "{{ item.0 }}"
-        image: "{{ vm_image }}"
-        flavor: "{{ vm_flavor }}"
-        key_name: "{{ vm_keypair }}"
-        network: "{{ vm_net }}"
-        auto_ip: yes
-        wait: yes
-        timeout: 600
-        config_drive: yes
-        userdata: |
+    - name: Create cloud-init config for each VM
+      copy:
+        dest: "/tmp/cloud-init-{{ item.0 }}.yml"
+        content: |
           #cloud-config
           package_update: true
           packages:
             - curl
             - nfs-common
+            - qemu-guest-agent
 
           runcmd:
+            # Disable swap
             - swapoff -a
             - sed -i '/swap/d' /etc/fstab
-
+            
+            # Install system-agent
             - |
               ROLES=""
-              {% if 'etcd' in item.1 %}ROLES="$ROLES --etcd"{% endif %}
-              {% if 'controlplane' in item.1 %}ROLES="$ROLES --controlplane"{% endif %}
-              {% if 'worker' in item.1 %}ROLES="$ROLES --worker"{% endif %}
-
+              # Parse roles from input string (e.g., "etcd,controlplane,worker" or just "worker")
+              {% if ',' in item.1 %}
+                {% set roles_list = item.1.split(',') %}
+                {% for role in roles_list %}
+                  {% if role.strip() == 'etcd' %}ROLES="$ROLES --etcd"{% endif %}
+                  {% if role.strip() == 'controlplane' %}ROLES="$ROLES --controlplane"{% endif %}
+                  {% if role.strip() == 'worker' %}ROLES="$ROLES --worker"{% endif %}
+                {% endfor %}
+              {% else %}
+                {% if item.1.strip() == 'etcd' %}ROLES="$ROLES --etcd"{% endif %}
+                {% if item.1.strip() == 'controlplane' %}ROLES="$ROLES --controlplane"{% endif %}
+                {% if item.1.strip() == 'worker' %}ROLES="$ROLES --worker"{% endif %}
+              {% endif %}
+              
+              echo "Installing RKE2 with roles: $ROLES"
+              
               curl --insecure -fL {{ rancher_url }}/system-agent-install.sh | \
               sh -s - \
                 --server {{ rancher_url }} \
@@ -158,6 +236,31 @@
                 --ca-checksum {{ ca_checksum }} \
                 --node-name {{ item.0 }} \
                 $ROLES
+            
+            # Ensure RKE2 service starts
+            - sleep 15
+            - systemctl start rke2-server 2>/dev/null || systemctl start rke2-agent 2>/dev/null || true
+            - sleep 10
+            
+            # Enable services to start on boot
+            - systemctl enable rke2-server 2>/dev/null || systemctl enable rke2-agent 2>/dev/null || true
+      loop: "{{ vm_names_list | zip(parsed_roles) | list }}"
+
+    - name: Create VMs on OpenStack
+      openstack.cloud.server:
+        state: present
+        name: "{{ item.0 }}"
+        image: "{{ vm_image }}"
+        flavor: "{{ vm_flavor }}"
+        key_name: "{{ vm_keypair }}"
+        network: "{{ vm_net }}"
+        userdata: "{{ lookup('file', '/tmp/cloud-init-' + item.0 + '.yml') }}"
+        auto_ip: yes
+        wait: yes
+        timeout: 600
+        config_drive: yes
+        security_groups: "default"
+        boot_volume_delete_on_termination: yes
       environment:
         OS_AUTH_URL: "{{ os_auth_url }}"
         OS_PROJECT_NAME: "{{ os_project_name }}"
@@ -169,11 +272,21 @@
         OS_INTERFACE: "{{ os_interface }}"
         OS_IDENTITY_API_VERSION: "{{ os_identity_api_version }}"
       loop: "{{ vm_names_list | zip(parsed_roles) | list }}"
+      register: vm_creation
+      async: 600
+      poll: 10
+
+    - name: Debug VM creation
+      debug:
+        msg: "Created VM {{ item.item.0 }} with status: {{ item.state }}"
+      loop: "{{ vm_creation.results }}"
+      loop_control:
+        label: "{{ item.item.0 }}"
 
     ###########################################################################
-    # WAIT FOR NODES
+    # WAIT FOR NODES TO REGISTER
     ###########################################################################
-    - name: Wait for nodes to register
+    - name: Wait for nodes to appear in Rancher
       uri:
         url: "{{ rancher_url }}/v3/nodes?clusterId={{ cluster_id }}"
         method: GET
@@ -181,14 +294,33 @@
           Authorization: "Bearer {{ rancher_token }}"
         validate_certs: no
       register: rancher_nodes
-      until: rancher_nodes.json.data | length >= vm_count
-      retries: 60
-      delay: 15
+      until: 
+        - rancher_nodes.json.data | length >= vm_count
+        - rancher_nodes.json.data | map(attribute='state') | list | select('search', 'active|registered') | list | length >= vm_count
+      retries: 30
+      delay: 30
+      ignore_errors: yes
+
+    - name: Debug registered nodes
+      debug:
+        msg: |
+          Registered Nodes:
+          {% for node in rancher_nodes.json.data %}
+          - {{ node.nodeName }}: {{ node.state }} ({{ node.conditions | selectattr('type', 'equalto', 'Ready') | first | default({}).status | default('Unknown') }})
+          {% endfor %}
+
+    - name: Check registration status
+      fail:
+        msg: |
+          Only {{ rancher_nodes.json.data | length }} out of {{ vm_count }} nodes registered.
+          Registered: {{ rancher_nodes.json.data | map(attribute='nodeName') | list }}
+          Expected: {{ vm_names_list }}
+      when: rancher_nodes.json.data | length < vm_count
 
     ###########################################################################
-    # WAIT FOR CLUSTER ACTIVE
+    # WAIT FOR CLUSTER TO BE ACTIVE
     ###########################################################################
-    - name: Wait for cluster ACTIVE
+    - name: Wait for cluster to be active
       uri:
         url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
         method: GET
@@ -197,15 +329,53 @@
         validate_certs: no
       register: cluster_state
       until: cluster_state.json.state == "active"
-      retries: 60
-      delay: 20
+      retries: 40
+      delay: 30
 
-    ###########################################################################
-    # SUCCESS
-    ###########################################################################
-    - name: SUCCESS
+    - name: Debug cluster state
       debug:
         msg: |
-          ✅ CLUSTER ACTIVE
-          Cluster: {{ cluster_name }}
-          Nodes: {{ rancher_nodes.json.data | length }}
+          Cluster State: {{ cluster_state.json.state }}
+          Transitioning: {{ cluster_state.json.transitioning | default('Unknown') }}
+          Conditions: {{ cluster_state.json.conditions | default([]) | to_nice_json }}
+
+    ###########################################################################
+    # GET FINAL NODE STATUS
+    ###########################################################################
+    - name: Get final node status
+      uri:
+        url: "{{ rancher_url }}/v3/nodes?clusterId={{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+      register: final_nodes
+
+    - name: Display deployment summary
+      debug:
+        msg: |
+          ✅ DEPLOYMENT COMPLETED SUCCESSFULLY
+          
+          Cluster Details:
+          - Name: {{ cluster_name }}
+          - ID: {{ cluster_id }}
+          - State: {{ cluster_state.json.state }}
+          - URL: {{ rancher_url }}/dashboard/c/{{ cluster_id }}
+          
+          Node Details:
+          {% for node in final_nodes.json.data %}
+          - {{ node.nodeName }}:
+            * State: {{ node.state }}
+            * Roles: {{ node.roles | default([]) | join(',') }}
+            * IP: {{ node.ipAddress | default('Unknown') }}
+            * Ready: {{ node.conditions | selectattr('type', 'equalto', 'Ready') | first | default({}).status | default('Unknown') }}
+          {% endfor %}
+          
+          Total Nodes: {{ final_nodes.json.data | length }}/{{ vm_count }}
+
+    - name: Clean up temporary cloud-init files
+      file:
+        path: "/tmp/cloud-init-{{ item }}.yml"
+        state: absent
+      loop: "{{ vm_names_list }}"
+      ignore_errors: yes
