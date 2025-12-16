@@ -1,80 +1,71 @@
 ---
-- name: Create OpenStack VMs and register to existing Rancher custom cluster
+- name: Create multiple VMs on OpenStack and auto-register to Rancher
   hosts: localhost
   connection: local
   gather_facts: no
 
   vars:
-    ###########################################################################
-    # RANCHER DETAILS
-    ###########################################################################
+    # Rancher details
     rancher_url: "https://192.168.210.32"
-    rancher_token: "token-XXXXXXXXXXXXXXXXXXXXXXXX"
+    rancher_token: "token-kt4rg:zppllkvsr7xl5cndlb4n4njqbckzjsmkd557xbgmh69bzdc7kqrkbl"
     cluster_name: "{{ cluster_name }}"
 
-    ###########################################################################
-    # SURVEY INPUTS
-    ###########################################################################
+    # Survey variables
     vm_count: "{{ vm_count | int }}"
     node_roles: "{{ node_roles }}"
-    vm_name_prefix: "{{ vm_name_prefix }}"
     vm_net: "{{ vm_net }}"
-    vm_flavor: "{{ vm_flavor }}"   # NAME or ID (both supported)
+    vm_flavor: "{{ vm_flavor }}"
+    vm_names_list: "{{ vm_name_prefix.split(',') }}"
 
-    ###########################################################################
-    # VM DETAILS
-    ###########################################################################
+    # VM details
     vm_image: "a997754d-6cdf-4a21-8e52-5df389d3f7c5"
     vm_keypair: "k8s"
 
-    ###########################################################################
-    # OPENSTACK AUTH
-    ###########################################################################
+    # OpenStack auth
     os_auth_url: "http://192.168.170.50:5000"
     os_project_name: "Production Engineering"
     os_project_domain_id: "default"
     os_username: "admin"
     os_user_domain_name: "Default"
-    os_password: "********"
+    os_password: "bLEZFvatBShkvUZyKrasUjmNdTTc9c3HcxWykrro"
     os_region_name: "RegionOne"
     os_interface: "public"
     os_identity_api_version: "3"
 
   tasks:
   ###########################################################################
-  # INPUT NORMALIZATION
+  # VALIDATION
   ###########################################################################
-  - name: Generate VM names
-    set_fact:
-      vm_names_list: >-
-        {{ range(1, vm_count + 1)
-           | map('string')
-           | map('regex_replace', '^(.*)$', vm_name_prefix ~ '\\1')
-           | list }}
-
-  - name: Normalize node roles
-    set_fact:
-      parsed_roles: "{{ node_roles.split(',') | map('trim') | list }}"
-
   - name: Validate inputs
     assert:
       that:
+        - vm_count >= 1
         - vm_names_list | length == vm_count
-        - parsed_roles | length == vm_count
-      fail_msg: >
-        VM count, VM names, and roles must match.
-        vm_count={{ vm_count }},
-        names={{ vm_names_list }},
-        roles={{ parsed_roles }}
+      fail_msg: "vm_count must match VM names"
 
-  - name: Build VM → role map
+  - name: Normalize node roles
+    set_fact:
+      parsed_roles: >-
+        {{
+          [node_roles]
+          if vm_count == 1
+          else (node_roles.split(',') | map('trim') | list)
+        }}
+
+  - name: Validate role count
+    assert:
+      that:
+        - parsed_roles | length == vm_count
+      fail_msg: "Role count must match vm_count"
+
+  - name: Build VM role mapping
     set_fact:
       vm_role_map: "{{ vm_names_list | zip(parsed_roles) | list }}"
 
   ###########################################################################
-  # GET RANCHER CLUSTER
+  # GET RANCHER CLUSTER INFO
   ###########################################################################
-  - name: Get Rancher cluster
+  - name: Get cluster ID from Rancher
     uri:
       url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
       method: GET
@@ -85,16 +76,25 @@
 
   - name: Fail if cluster not found
     fail:
-      msg: "Cluster {{ cluster_name }} not found in Rancher"
+      msg: "Cluster '{{ cluster_name }}' not found in Rancher."
     when: cluster_info.json.data | length == 0
 
   - set_fact:
       cluster_id: "{{ cluster_info.json.data[0].id }}"
 
   ###########################################################################
-  # GET REGISTRATION COMMAND
+  # GET RANCHER JOIN TOKEN
   ###########################################################################
-  - name: Ensure registration token exists
+  - name: Check for existing registration tokens
+    uri:
+      url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
+      method: GET
+      headers:
+        Authorization: "Bearer {{ rancher_token }}"
+      validate_certs: no
+    register: existing_tokens
+
+  - name: Create registration token if needed
     uri:
       url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
       method: POST
@@ -104,9 +104,10 @@
       body:
         clusterId: "{{ cluster_id }}"
       validate_certs: no
-    failed_when: false
+    when: existing_tokens.json.data | length == 0
+    ignore_errors: yes
 
-  - name: Fetch registration command
+  - name: Wait for node command to be ready
     uri:
       url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
       method: GET
@@ -114,12 +115,18 @@
         Authorization: "Bearer {{ rancher_token }}"
       validate_certs: no
     register: reg_info
-    until: reg_info.json.data[0].nodeCommand is defined
-    retries: 20
-    delay: 5
+    until:
+      - reg_info.json.data[0].nodeCommand is defined
+      - reg_info.json.data[0].nodeCommand != ""
+    retries: 15
+    delay: 3
 
   - set_fact:
-      node_command: "{{ reg_info.json.data[0].nodeCommand | replace('curl ', 'curl -k ') }}"
+      node_command_raw: "{{ reg_info.json.data[0].nodeCommand }}"
+      rancher_token_id: "{{ reg_info.json.data[0].token }}"
+
+  - set_fact:
+      node_command: "{{ node_command_raw | replace('curl ', 'curl -k ') }}"
 
   ###########################################################################
   # CLOUD-INIT
@@ -133,41 +140,41 @@
         packages:
           - curl
           - docker.io
+          - jq
           - nfs-common
 
         runcmd:
           - systemctl enable docker
           - systemctl start docker
-          - swapoff -a
-          - sed -i '/swap/d' /etc/fstab
           - sleep 10
           - |
-            CMD='{{ node_command }}'
-            {% if 'etcd' in item.1 %}CMD="$CMD --etcd"{% endif %}
-            {% if 'controlplane' in item.1 %}CMD="$CMD --controlplane"{% endif %}
-            {% if 'worker' in item.1 %}CMD="$CMD --worker"{% endif %}
-            CMD="$CMD --node-name {{ item.0 }}"
-            echo "$CMD" > /root/join.sh
+            FINAL_CMD='{{ node_command }}'
+            {% if 'etcd' in item.1 %}FINAL_CMD="$FINAL_CMD --etcd"{% endif %}
+            {% if 'controlplane' in item.1 %}FINAL_CMD="$FINAL_CMD --controlplane"{% endif %}
+            {% if 'worker' in item.1 %}FINAL_CMD="$FINAL_CMD --worker"{% endif %}
+            FINAL_CMD="$FINAL_CMD --node-name {{ item.0 }}"
+            echo "$FINAL_CMD" > /root/join.sh
             chmod +x /root/join.sh
             /root/join.sh
     loop: "{{ vm_role_map }}"
 
   ###########################################################################
-  # CREATE OPENSTACK VMS (FLAVOR NAME OR ID SUPPORTED)
+  # CREATE VMS
   ###########################################################################
   - name: Create VM on OpenStack
     openstack.cloud.server:
       state: present
       name: "{{ item.0 }}"
       image: "{{ vm_image }}"
-      flavor: "{{ vm_flavor }}"   # ✅ NAME OR ID
+      flavor: "{{ vm_flavor }}"
       key_name: "{{ vm_keypair }}"
       network: "{{ vm_net }}"
       userdata: "{{ lookup('file', '/tmp/cloud-init-' + item.0 + '.yml') }}"
       auto_ip: yes
       wait: yes
-      timeout: 600
+      timeout: 300
       config_drive: yes
+      security_groups: "default"
     environment:
       OS_AUTH_URL: "{{ os_auth_url }}"
       OS_PROJECT_NAME: "{{ os_project_name }}"
@@ -182,9 +189,22 @@
     register: vms
 
   ###########################################################################
-  # WAIT FOR NODES
+  # SHOW VM IPs (FIXED)
   ###########################################################################
-  - name: Wait for nodes to register
+  - name: Show VM IPs
+    debug:
+      msg: >
+        VM {{ item.0 }} created
+        IP: {{
+          vms.results[loop.index0].server.accessIPv4
+          | default('N/A')
+        }}
+    loop: "{{ vm_role_map }}"
+
+  ###########################################################################
+  # WAIT FOR NODES TO REGISTER
+  ###########################################################################
+  - name: Wait for nodes to appear in Rancher
     uri:
       url: "{{ rancher_url }}/v3/nodes?clusterId={{ cluster_id }}"
       method: GET
@@ -193,27 +213,38 @@
       validate_certs: no
     register: rancher_nodes
     until: rancher_nodes.json.data | length >= vm_count
-    retries: 60
+    retries: 30
     delay: 10
 
   ###########################################################################
   # WAIT FOR CLUSTER ACTIVE
   ###########################################################################
-  - name: Wait for cluster ACTIVE
+  - name: Wait for cluster to become active
     uri:
       url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
       method: GET
       headers:
         Authorization: "Bearer {{ rancher_token }}"
       validate_certs: no
-    register: cluster_state
-    until: cluster_state.json.state == "active"
-    retries: 60
+    register: cluster_status
+    until:
+      - cluster_status.json.state == "active"
+    retries: 50
     delay: 10
 
-  - name: Success
+  ###########################################################################
+  # CLEANUP
+  ###########################################################################
+  - name: Clean temp files
+    file:
+      path: "/tmp/cloud-init-{{ item }}.yml"
+      state: absent
+    loop: "{{ vm_names_list }}"
+
+  - name: Success message
     debug:
       msg: |
-        🎉 CLUSTER ACTIVE
-        Name: {{ cluster_name }}
-        Nodes: {{ rancher_nodes.json.data | length }}
+        ✅ SUCCESS!
+        Cluster: {{ cluster_name }}
+        State: {{ cluster_status.json.state }}
+        VMs: {{ vm_names_list | join(', ') }}
