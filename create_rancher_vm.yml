@@ -18,7 +18,7 @@
     vm_names_list: "{{ vm_name_prefix.split(',') }}"
 
     # VM details
-    vm_image: "494c4e8c-d11b-43b7-9e8b-df4009b7102b"
+    vm_image: "a997754d-6cdf-4a21-8e52-5df389d3f7c5"
     vm_keypair: "k8s"
 
     # OpenStack auth
